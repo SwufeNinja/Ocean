@@ -1,0 +1,46 @@
+ocr:
+  engine: mineru
+  api_base_url: https://mineru.net
+  api_token: ${MINERU_API_TOKEN}
+  fallback_engine: paddleocr
+  output_markdown: true
+  output_json: true
+  options:
+    model_version: vlm
+    language: ch
+    is_ocr: true
+    enable_table: true
+    enable_formula: true
+    poll_interval_seconds: 5
+    max_wait_seconds: 1800
+    download_timeout_seconds: 120
+    max_pages_per_file: 200
+
+extraction:
+  keywords:
+    - 青年
+    - 共青团
+    - 青年工作
+  keyword_match_mode: any
+  context_before_paragraphs: 1
+  context_after_paragraphs: 1
+  semantic_topics:
+    - name: 党的青年工作政策
+      description: >
+        包括青年教育、青年组织、青年动员、青年干部培养、共青团工作、
+        青年就业、青年思想政治工作、青年参与国家建设等内容。
+  chunk_pages: 3
+  output_formats:
+    - md
+    - json
+    - csv
+
+llm:
+  provider: openai_compatible
+  api_base_url: ${LLM_API_BASE_URL}
+  api_key: ${LLM_API_KEY}
+  model: ${LLM_MODEL}
+  temperature: 0
+  max_tokens: 4096
+  timeout_seconds: 120
+  retry: 3

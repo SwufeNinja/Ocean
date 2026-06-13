@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+
+# macOS
+.DS_Store
+
+# Local secrets
+.env
+config.yaml
+
+# Runtime outputs
+outputs/
+pdfs/
