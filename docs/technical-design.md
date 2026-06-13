@@ -26,9 +26,9 @@
 
 OCR 服务通过抽象接口接入，不在业务流程中写死具体供应商。
 
-初期预留：
+当前已接入：
 
-- PaddleOCR API client（预留）
+- PaddleOCR 官方 hosted async Job API client
 - MinerU API client（已按 v4 API 接入）
 
 由于不同 API 的请求和返回格式可能不同，系统内部统一使用 `OcrDocument` 数据结构。
@@ -231,22 +231,26 @@ ocean extract-semantic --ocr-dir ./outputs/ocr --output ./outputs/extract --conf
 
 ## 8. 当前实现边界
 
-第一版只搭建可运行骨架：
+当前已完成可运行的 MVP 主链路：
 
 - OCR client 接口已经定义。
 - MinerU client 已实现 v4 API 的上传、轮询、下载和结果归一化。
-- PaddleOCR client 暂时预留 API 调用位置。
+- PaddleOCR client 已实现官方异步 Job API 的提交、轮询、结果下载和归一化。
 - LLM client 按 OpenAI-compatible Chat Completions 实现。
 - 关键词提取可以直接基于 OCR JSON 运行。
 - Markdown/JSON/CSV 导出可用。
+- 批量 OCR 已支持逐文件失败隔离，单个 PDF 失败不会中断后续文件。
+- 已支持主 OCR 引擎失败后尝试 `fallback_engine`。
+- 备用引擎可通过 `ocr_engines.<engine>` 配置独立连接参数和 OCR 选项。
+- 每次批量 OCR 会输出 `ocr/run_report.json`，记录批次状态、文件状态、引擎尝试、错误、页数、时间和输出路径。
+- Web UI 初版已实现 PDF 上传、OCR 引擎选择、进度显示和 Markdown 阅读。
 
 ## 9. 后续扩展方向
 
-1. 使用真实 MinerU token 进行样本测试。
-2. 接入真实 PaddleOCR API。
-3. 增加 OCR 质量对比脚本。
-4. 增加简繁转换。
-5. 增加 PDF 页面截图和 OCR 文本对照校验。
-6. 增加 Web UI。
-7. 增加任务数据库和断点续跑。
-8. 增加人工审核与标注界面。
+1. 完善部分页面失败的 `partial_success` 状态和失败页记录。
+2. 增加简繁转换、正则匹配和更多关键词提取粒度。
+3. 增加 LLM 单 chunk 失败隔离、prompt 配置化和输出校验。
+4. 实现关键词结果与 LLM 结果的合并、去重和混合命中记录。
+5. 增加任务数据库和断点续跑。
+6. 扩展 Web UI 的任务历史、OCR JSON 下载和提取功能。
+7. 增加人工审核与标注界面。

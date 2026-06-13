@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import math
+import os
 import re
 import threading
 import uuid
@@ -13,23 +14,40 @@ from typing import Any
 
 from ocean.config import load_config
 from ocean.exporters import write_ocr_markdown
+from ocean.extractors import extract_keywords
 from ocean.logging_utils import log, set_log_file
+from ocean.models import ExtractionResult, OcrDocument
 from ocean.ocr import create_ocr_client
 from ocean.pdf_utils import count_pdf_pages, split_pdf
 from ocean.pipeline import _merge_part_documents, _offset_document_pages
 
 try:
-    from fastapi import FastAPI, File, HTTPException, UploadFile
-    from fastapi.responses import HTMLResponse, PlainTextResponse
+    from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+    from fastapi.staticfiles import StaticFiles
+    from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 except ImportError:  # pragma: no cover
-    FastAPI = File = HTTPException = UploadFile = None  # type: ignore[assignment]
-    HTMLResponse = PlainTextResponse = None  # type: ignore[assignment]
+    FastAPI = File = Form = HTTPException = UploadFile = None  # type: ignore[assignment]
+    StaticFiles = None  # type: ignore[assignment]
+    FileResponse = HTMLResponse = PlainTextResponse = None  # type: ignore[assignment]
+
+
+ENGINE_LABELS = {
+    "paddleocr": "PaddleOCR",
+    "mineru": "MinerU",
+}
+ENGINE_ALIASES = {
+    "paddle": "paddleocr",
+    "paddleocr": "paddleocr",
+    "mineru": "mineru",
+    "mineruocr": "mineru",
+}
 
 
 @dataclass(slots=True)
 class WebJob:
     job_id: str
     file_name: str
+    engine: str
     job_dir: Path
     input_path: Path
     log_path: Path
@@ -38,30 +56,44 @@ class WebJob:
     message: str = "等待处理"
     total_pages: int | None = None
     markdown_path: Path | None = None
+    ocr_document: OcrDocument | None = None
     error: str | None = None
     created_at: str = ""
     updated_at: str = ""
 
     def to_dict(self) -> dict[str, Any]:
+        markdown_url = f"/api/jobs/{self.job_id}/markdown" if self.markdown_path else None
+        download_url = f"/api/jobs/{self.job_id}/download" if self.markdown_path else None
+        pages_url = f"/api/jobs/{self.job_id}/pages" if self.ocr_document else None
         return {
             "job_id": self.job_id,
             "file_name": self.file_name,
+            "engine": self.engine,
+            "engine_label": ENGINE_LABELS.get(self.engine, self.engine),
             "state": self.state,
             "progress": self.progress,
             "message": self.message,
             "total_pages": self.total_pages,
             "error": self.error,
-            "markdown_url": f"/api/jobs/{self.job_id}/markdown" if self.markdown_path else None,
+            "markdown_url": markdown_url,
+            "download_url": download_url,
+            "pages_url": pages_url,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
 
 
 def make_app(config: dict[str, Any], output_dir: str | Path = "./outputs"):
-    if FastAPI is None or File is None or HTTPException is None or UploadFile is None:
+    if FastAPI is None or File is None or Form is None or HTTPException is None or UploadFile is None:
         raise RuntimeError("Web UI dependencies are missing. Run: pip install -e .")
 
-    app = FastAPI(title="Ocean MinerU Web")
+    app = FastAPI(title="Ocean OCR Web")
+    frontend_dist = _frontend_dist_root()
+    frontend_index = frontend_dist / "index.html"
+    frontend_assets = frontend_dist / "assets"
+    if StaticFiles is not None and frontend_assets.exists():
+        app.mount("/assets", StaticFiles(directory=frontend_assets), name="assets")
+
     output_root = Path(output_dir).expanduser().resolve()
     web_root = output_root / "web_jobs"
     upload_root = output_root / "web_uploads"
@@ -71,10 +103,26 @@ def make_app(config: dict[str, Any], output_dir: str | Path = "./outputs"):
 
     @app.get("/", response_class=HTMLResponse)
     def index() -> str:
-        return INDEX_HTML
+        if not frontend_index.exists():
+            raise HTTPException(
+                status_code=503,
+                detail="Frontend build is missing. Run npm run build in the frontend directory.",
+            )
+        return frontend_index.read_text(encoding="utf-8")
+
+    @app.get("/api/engines")
+    def list_engines() -> dict[str, Any]:
+        return {
+            "default_engine": "paddleocr",
+            "engines": [
+                {"value": "paddleocr", "label": "PaddleOCR", "description": "默认：适合快速文档 OCR"},
+                {"value": "mineru", "label": "MinerU", "description": "适合版面复杂的长文档解析"},
+            ],
+        }
 
     @app.post("/api/jobs")
-    async def create_job(file: UploadFile = File(...)) -> dict[str, Any]:
+    async def create_job(file: UploadFile = File(...), engine: str = Form("paddleocr")) -> dict[str, Any]:
+        selected_engine = _normalize_engine(engine)
         original_filename = Path(file.filename or "").name
         if not original_filename.lower().endswith(".pdf"):
             raise HTTPException(status_code=400, detail="只支持 PDF 文件")
@@ -95,6 +143,7 @@ def make_app(config: dict[str, Any], output_dir: str | Path = "./outputs"):
         job = WebJob(
             job_id=job_id,
             file_name=filename,
+            engine=selected_engine,
             job_dir=job_dir,
             input_path=input_path,
             log_path=job_dir / "ocr_run.log",
@@ -126,6 +175,83 @@ def make_app(config: dict[str, Any], output_dir: str | Path = "./outputs"):
             raise HTTPException(status_code=404, detail="Markdown 还没有生成")
         return job.markdown_path.read_text(encoding="utf-8")
 
+    @app.get("/api/jobs/{job_id}/pages")
+    def get_pages(job_id: str) -> dict[str, Any]:
+        job = _get_job_or_404(job_id, jobs, jobs_lock)
+        if job.state != "done" or job.ocr_document is None:
+            raise HTTPException(status_code=404, detail="OCR pages are not ready")
+        return {
+            "source_file": job.ocr_document.source_file,
+            "total_pages": len(job.ocr_document.pages),
+            "pages": [
+                {"page_number": page.page_number, "markdown": page.text.strip()}
+                for page in job.ocr_document.pages
+            ],
+        }
+
+    @app.get("/api/jobs/{job_id}/download")
+    def download_markdown(job_id: str):
+        job = _get_job_or_404(job_id, jobs, jobs_lock)
+        if job.state != "done" or not job.markdown_path or not job.markdown_path.exists():
+            raise HTTPException(status_code=404, detail="Markdown 还没有生成")
+        return FileResponse(
+            path=job.markdown_path,
+            media_type="text/markdown; charset=utf-8",
+            filename=job.markdown_path.name,
+        )
+
+    @app.post("/api/jobs/{job_id}/extract-keywords")
+    def extract_job_keywords(
+        job_id: str,
+        keywords: str = Form(...),
+        match_mode: str = Form("any"),
+        context_before: int = Form(1),
+        context_after: int = Form(1),
+        granularity: str = Form("paragraph"),
+        use_regex: bool = Form(False),
+        case_sensitive: bool = Form(True),
+        normalize_chinese: bool = Form(False),
+        deduplicate: bool = Form(True),
+    ) -> dict[str, Any]:
+        job = _get_job_or_404(job_id, jobs, jobs_lock)
+        if job.state != "done" or job.ocr_document is None:
+            raise HTTPException(status_code=400, detail="OCR 完成后才能提取关键词")
+
+        parsed_keywords = _parse_keywords(keywords)
+        if not parsed_keywords:
+            raise HTTPException(status_code=400, detail="请至少输入一个关键词")
+        normalized_mode = str(match_mode or "any").lower()
+        if normalized_mode not in {"any", "all"}:
+            raise HTTPException(status_code=400, detail="match_mode 只支持 any 或 all")
+        normalized_granularity = str(granularity or "paragraph").lower()
+        if normalized_granularity not in {"paragraph", "page"}:
+            raise HTTPException(status_code=400, detail="granularity 只支持 paragraph 或 page")
+
+        results = extract_keywords(
+            document=job.ocr_document,
+            keywords=parsed_keywords,
+            match_mode=normalized_mode,
+            context_before=max(0, int(context_before)),
+            context_after=max(0, int(context_after)),
+            granularity=normalized_granularity,
+            use_regex=bool(use_regex),
+            case_sensitive=bool(case_sensitive),
+            normalize_chinese=bool(normalize_chinese),
+            deduplicate=bool(deduplicate),
+        )
+        return {
+            "keywords": parsed_keywords,
+            "match_mode": normalized_mode,
+            "granularity": normalized_granularity,
+            "use_regex": bool(use_regex),
+            "case_sensitive": bool(case_sensitive),
+            "normalize_chinese": bool(normalize_chinese),
+            "deduplicate": bool(deduplicate),
+            "count": len(results),
+            "markdown": _keyword_results_markdown(results, parsed_keywords, normalized_mode),
+            "results": [result.to_dict() for result in results],
+        }
+
     return app
 
 
@@ -142,7 +268,7 @@ def serve(config: dict[str, Any], output_dir: str | Path, host: str = "127.0.0.1
 def main() -> None:
     import argparse
 
-    parser = argparse.ArgumentParser(prog="ocean-web", description="Start Ocean MinerU web UI.")
+    parser = argparse.ArgumentParser(prog="ocean-web", description="Start Ocean OCR web UI.")
     parser.add_argument("--config", required=True, help="YAML config path.")
     parser.add_argument("--output", default="./outputs", help="Output directory.")
     parser.add_argument("--host", default="127.0.0.1", help="Web server host.")
@@ -184,23 +310,21 @@ def _recognize_job(
     if not job:
         return
 
-    ocr_config = copy.deepcopy(config.get("ocr", {}))
-    ocr_config["engine"] = "mineru"
-    ocr_config["output_json"] = False
-    ocr_config["output_markdown"] = True
+    ocr_config = _web_ocr_config(config, job.engine)
     options = ocr_config.get("options", {})
     max_pages = int(options.get("max_pages_per_file", 200))
     client = create_ocr_client(ocr_config)
+    engine_label = ENGINE_LABELS.get(job.engine, job.engine)
 
     _update_job(jobs, jobs_lock, job_id, state="running", progress=3, message="读取 PDF 页数")
     total_pages = count_pdf_pages(job.input_path)
     _update_job(jobs, jobs_lock, job_id, total_pages=total_pages)
-    log(f"Web OCR started: {job.file_name}; pages={total_pages}; max_pages_per_file={max_pages}.")
+    log(f"Web OCR started: {job.file_name}; engine={job.engine}; pages={total_pages}; max_pages_per_file={max_pages}.")
 
     if total_pages <= max_pages:
-        _update_job(jobs, jobs_lock, job_id, progress=12, message="上传 MinerU 并等待解析")
+        _update_job(jobs, jobs_lock, job_id, progress=12, message=f"提交到 {engine_label} 并等待解析")
         document = client.recognize_pdf(job.input_path, options)
-        _update_job(jobs, jobs_lock, job_id, progress=88, message="MinerU 解析完成，正在生成 Markdown")
+        _update_job(jobs, jobs_lock, job_id, progress=88, message=f"{engine_label} 解析完成，正在生成 Markdown")
     else:
         with TemporaryDirectory(prefix="ocean_web_pdf_split_") as temp_dir:
             parts = split_pdf(job.input_path, temp_dir, max_pages=max_pages)
@@ -239,7 +363,66 @@ def _recognize_job(
         progress=100,
         message="处理完成",
         markdown_path=markdown_path,
+        ocr_document=document,
     )
+
+
+def _web_ocr_config(config: dict[str, Any], engine: str) -> dict[str, Any]:
+    ocr_config = copy.deepcopy(config.get("ocr", {}))
+    engine_configs = copy.deepcopy(config.get("ocr_engines", {}))
+    current_engine = _normalize_engine(ocr_config.get("engine", "paddleocr"))
+
+    if engine in engine_configs and isinstance(engine_configs[engine], dict):
+        merged = copy.deepcopy(ocr_config)
+        merged.update(engine_configs[engine])
+        ocr_config = merged
+    elif current_engine != engine:
+        # When switching engines in the UI, prefer environment variables over the
+        # single CLI-oriented config block so both providers can coexist.
+        ocr_config["api_base_url"] = ""
+        ocr_config["api_token"] = ""
+
+    ocr_config["engine"] = engine
+    ocr_config["output_json"] = False
+    ocr_config["output_markdown"] = True
+    ocr_config.setdefault("options", {})
+
+    if engine == "paddleocr":
+        ocr_config["api_base_url"] = (
+            ocr_config.get("api_base_url")
+            or os.getenv("PADDLEOCR_API_BASE_URL")
+            or "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
+        )
+        ocr_config["api_token"] = ocr_config.get("api_token") or os.getenv("PADDLEOCR_API_TOKEN", "")
+        options = ocr_config["options"]
+        options.setdefault("model", "PaddleOCR-VL-1.6")
+        options.setdefault("auth_scheme", "bearer")
+        options.setdefault("timeout_seconds", 600)
+        options.setdefault("poll_interval_seconds", 5)
+        options.setdefault("max_wait_seconds", 1800)
+        options.setdefault("download_timeout_seconds", 600)
+        options.setdefault("max_pages_per_file", 10)
+    elif engine == "mineru":
+        ocr_config["api_base_url"] = ocr_config.get("api_base_url") or os.getenv("MINERU_API_BASE_URL") or "https://mineru.net"
+        ocr_config["api_token"] = ocr_config.get("api_token") or os.getenv("MINERU_API_TOKEN", "")
+        options = ocr_config["options"]
+        options.setdefault("model_version", "vlm")
+        options.setdefault("language", "ch")
+        options.setdefault("is_ocr", True)
+        options.setdefault("enable_table", True)
+        options.setdefault("enable_formula", True)
+        options.setdefault("poll_interval_seconds", 5)
+        options.setdefault("max_wait_seconds", 1800)
+        options.setdefault("download_timeout_seconds", 120)
+        options.setdefault("max_pages_per_file", 200)
+    return ocr_config
+
+
+def _normalize_engine(engine: Any) -> str:
+    normalized = ENGINE_ALIASES.get(str(engine or "paddleocr").strip().lower())
+    if not normalized:
+        raise HTTPException(status_code=400, detail=f"不支持的 OCR 引擎：{engine}")
+    return normalized
 
 
 def _part_progress(completed_parts: int, total_parts: int) -> int:
@@ -282,475 +465,56 @@ def _read_log_tail(path: Path, max_lines: int = 80) -> list[str]:
     return lines[-max_lines:]
 
 
+def _parse_keywords(value: str) -> list[str]:
+    return [item.strip() for item in re.split(r"[,，;；\n]+", value) if item.strip()]
+
+
+def _frontend_dist_root() -> Path:
+    return Path(__file__).resolve().parents[2] / "frontend" / "dist"
+
+
+
+
+def _keyword_results_markdown(results: list[ExtractionResult], keywords: list[str], match_mode: str) -> str:
+    lines = [
+        "# 关键词提取结果",
+        "",
+        f"- 关键词：{', '.join(keywords)}",
+        f"- 匹配模式：{match_mode}",
+        f"- 命中结果：{len(results)} 条",
+        "",
+    ]
+    for result in results:
+        page_label = (
+            f"第 {result.page_start}-{result.page_end} 页"
+            if result.page_start != result.page_end
+            else f"第 {result.page_start} 页"
+        )
+        lines.extend(
+            [
+                f"## {result.result_id}",
+                "",
+                f"- 来源文件：{result.source_file}",
+                f"- 页码：{page_label}",
+                f"- 提取方式：{result.extraction_method}",
+                f"- 命中关键词：{', '.join(result.matched_keywords)}",
+                "",
+                result.text.strip(),
+                "",
+            ]
+        )
+    return "\n".join(lines)
 def _safe_pdf_name(filename: str) -> str:
     name = Path(filename).name
-    name = re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("._")
-    if not name:
-        name = "upload.pdf"
-    return name
+    stem = re.sub(r"[^\w.()（）\[\]【】 -]+", "_", name, flags=re.UNICODE).strip(" ._")
+    return stem or "upload.pdf"
 
 
 def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-INDEX_HTML = """
-<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Ocean MinerU Markdown Reader</title>
-  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/dompurify/dist/purify.min.js"></script>
-  <style>
-    :root {
-      --ink: #1e2a24;
-      --muted: #66756d;
-      --paper: #fbf7ed;
-      --card: rgba(255, 252, 243, 0.92);
-      --line: rgba(33, 49, 42, 0.14);
-      --accent: #d96b2b;
-      --accent-2: #245f73;
-      --good: #287a4f;
-      --bad: #a53b2c;
-      --shadow: 0 24px 80px rgba(36, 47, 41, 0.18);
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      min-height: 100vh;
-      color: var(--ink);
-      font-family: "Iowan Old Style", "Songti SC", "Noto Serif CJK SC", Georgia, serif;
-      background:
-        radial-gradient(circle at 8% 12%, rgba(217, 107, 43, 0.20), transparent 24rem),
-        radial-gradient(circle at 88% 4%, rgba(36, 95, 115, 0.24), transparent 28rem),
-        linear-gradient(135deg, #efe5cf 0%, #f8f1df 42%, #e6efe8 100%);
-    }
-    body::before {
-      content: "";
-      position: fixed;
-      inset: 0;
-      pointer-events: none;
-      background-image: linear-gradient(rgba(30, 42, 36, 0.05) 1px, transparent 1px);
-      background-size: 100% 34px;
-      mix-blend-mode: multiply;
-    }
-    .shell {
-      width: min(1180px, calc(100% - 32px));
-      margin: 0 auto;
-      padding: 44px 0 72px;
-    }
-    .hero {
-      display: grid;
-      grid-template-columns: 0.95fr 1.05fr;
-      gap: 24px;
-      align-items: stretch;
-    }
-    .panel {
-      border: 1px solid var(--line);
-      border-radius: 28px;
-      background: var(--card);
-      box-shadow: var(--shadow);
-      backdrop-filter: blur(14px);
-    }
-    .intro {
-      padding: 34px;
-      overflow: hidden;
-      position: relative;
-    }
-    .intro::after {
-      content: "MinerU";
-      position: absolute;
-      right: -18px;
-      bottom: -30px;
-      color: rgba(36, 95, 115, 0.08);
-      font-size: 108px;
-      font-weight: 800;
-      letter-spacing: -0.08em;
-    }
-    .eyebrow {
-      display: inline-flex;
-      gap: 8px;
-      align-items: center;
-      padding: 7px 12px;
-      border-radius: 999px;
-      color: var(--accent-2);
-      background: rgba(36, 95, 115, 0.10);
-      font: 700 12px/1.1 "Avenir Next", "PingFang SC", sans-serif;
-      letter-spacing: 0.12em;
-      text-transform: uppercase;
-    }
-    h1 {
-      margin: 22px 0 14px;
-      max-width: 620px;
-      font-size: clamp(36px, 6vw, 70px);
-      line-height: 0.94;
-      letter-spacing: -0.065em;
-    }
-    .lede {
-      position: relative;
-      z-index: 1;
-      max-width: 620px;
-      margin: 0;
-      color: var(--muted);
-      font-size: 18px;
-      line-height: 1.8;
-    }
-    .upload {
-      padding: 24px;
-    }
-    .drop {
-      display: grid;
-      place-items: center;
-      min-height: 230px;
-      padding: 28px;
-      border: 2px dashed rgba(36, 95, 115, 0.36);
-      border-radius: 24px;
-      background:
-        linear-gradient(135deg, rgba(255,255,255,0.60), rgba(255,255,255,0.18)),
-        repeating-linear-gradient(-45deg, transparent 0 12px, rgba(217,107,43,0.06) 12px 24px);
-      text-align: center;
-      transition: 180ms ease;
-    }
-    .drop.dragging {
-      border-color: var(--accent);
-      transform: translateY(-2px);
-      background-color: rgba(217, 107, 43, 0.08);
-    }
-    .drop strong {
-      display: block;
-      margin-bottom: 8px;
-      font-size: 24px;
-      letter-spacing: -0.03em;
-    }
-    .drop span {
-      color: var(--muted);
-      font-family: "Avenir Next", "PingFang SC", sans-serif;
-      font-size: 14px;
-    }
-    input[type=file] { display: none; }
-    .actions {
-      display: flex;
-      gap: 12px;
-      align-items: center;
-      margin-top: 18px;
-      flex-wrap: wrap;
-    }
-    button, .file-button {
-      border: 0;
-      border-radius: 999px;
-      padding: 13px 18px;
-      color: #fff;
-      background: var(--ink);
-      font: 800 14px/1 "Avenir Next", "PingFang SC", sans-serif;
-      cursor: pointer;
-      box-shadow: 0 10px 24px rgba(30, 42, 36, 0.18);
-    }
-    button.secondary, .file-button {
-      color: var(--ink);
-      background: rgba(30, 42, 36, 0.10);
-      box-shadow: none;
-    }
-    button:disabled {
-      cursor: not-allowed;
-      opacity: 0.52;
-    }
-    .file-name {
-      color: var(--muted);
-      font: 700 13px/1.4 "Avenir Next", "PingFang SC", sans-serif;
-    }
-    .status {
-      margin-top: 24px;
-      padding: 20px;
-      border-radius: 22px;
-      background: rgba(255, 255, 255, 0.45);
-      border: 1px solid var(--line);
-    }
-    .status-line {
-      display: flex;
-      justify-content: space-between;
-      gap: 16px;
-      color: var(--muted);
-      font: 800 13px/1.4 "Avenir Next", "PingFang SC", sans-serif;
-    }
-    .bar {
-      height: 15px;
-      margin-top: 12px;
-      overflow: hidden;
-      border-radius: 999px;
-      background: rgba(30, 42, 36, 0.10);
-    }
-    .bar > i {
-      display: block;
-      width: 0%;
-      height: 100%;
-      border-radius: inherit;
-      background: linear-gradient(90deg, var(--accent), #efb247, var(--accent-2));
-      transition: width 420ms ease;
-    }
-    .reader {
-      margin-top: 24px;
-      padding: clamp(22px, 4vw, 46px);
-    }
-    .reader-head {
-      display: flex;
-      justify-content: space-between;
-      gap: 16px;
-      align-items: baseline;
-      padding-bottom: 18px;
-      border-bottom: 1px solid var(--line);
-    }
-    .reader h2 {
-      margin: 0;
-      font-size: clamp(24px, 3vw, 38px);
-      letter-spacing: -0.045em;
-    }
-    .hint {
-      color: var(--muted);
-      font: 700 13px/1.5 "Avenir Next", "PingFang SC", sans-serif;
-    }
-    .markdown {
-      max-width: 880px;
-      margin: 28px auto 0;
-      font-size: 18px;
-      line-height: 1.86;
-    }
-    .markdown h1, .markdown h2, .markdown h3 {
-      letter-spacing: -0.04em;
-      line-height: 1.1;
-    }
-    .markdown h1 { font-size: 38px; }
-    .markdown h2 {
-      margin-top: 42px;
-      padding-top: 24px;
-      border-top: 1px solid var(--line);
-      color: var(--accent-2);
-      font-size: 28px;
-    }
-    .markdown p { margin: 0 0 1em; }
-    .markdown table {
-      width: 100%;
-      border-collapse: collapse;
-      margin: 20px 0;
-      font-size: 15px;
-    }
-    .markdown th, .markdown td {
-      border: 1px solid var(--line);
-      padding: 10px;
-      vertical-align: top;
-    }
-    .markdown pre {
-      overflow: auto;
-      padding: 18px;
-      border-radius: 16px;
-      background: rgba(30, 42, 36, 0.08);
-    }
-    .logs {
-      max-height: 180px;
-      margin-top: 16px;
-      padding: 12px;
-      overflow: auto;
-      border-radius: 14px;
-      color: #516159;
-      background: rgba(30, 42, 36, 0.06);
-      font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      white-space: pre-wrap;
-    }
-    .is-hidden { display: none; }
-    @media (max-width: 860px) {
-      .hero { grid-template-columns: 1fr; }
-      .shell { padding-top: 22px; }
-      .intro, .upload { padding: 22px; }
-      .reader-head { display: block; }
-    }
-  </style>
-</head>
-<body>
-  <main class="shell">
-    <section class="hero">
-      <div class="panel intro">
-        <span class="eyebrow">Ocean OCR</span>
-        <h1>上传 PDF，等待 MinerU，直接读 Markdown。</h1>
-        <p class="lede">这个页面只走 MinerU 版 OCR 链路。超过 200 页的 PDF 会按配置自动切分，处理完成后只展示 Markdown 阅读器，不导出 JSON。</p>
-      </div>
 
-      <form class="panel upload" id="uploadForm">
-        <label class="drop" id="dropZone" for="pdfFile">
-          <span>
-            <strong>把 PDF 拖到这里</strong>
-            或点击选择文件，支持大 PDF 自动分段处理
-          </span>
-        </label>
-        <input id="pdfFile" name="file" type="file" accept="application/pdf,.pdf" />
-        <div class="actions">
-          <label class="file-button" for="pdfFile">选择 PDF</label>
-          <button id="startBtn" type="submit" disabled>开始处理</button>
-          <span class="file-name" id="fileName">还没有选择文件</span>
-        </div>
-        <div class="status" id="statusBox">
-          <div class="status-line">
-            <span id="statusText">等待上传</span>
-            <span id="percentText">0%</span>
-          </div>
-          <div class="bar"><i id="progressBar"></i></div>
-          <div class="logs is-hidden" id="logs"></div>
-        </div>
-      </form>
-    </section>
+if __name__ == "__main__":
+    main()
 
-    <section class="panel reader is-hidden" id="reader">
-      <div class="reader-head">
-        <h2>Markdown 阅读器</h2>
-        <span class="hint" id="readerHint">处理完成后会自动显示</span>
-      </div>
-      <article class="markdown" id="markdownView"></article>
-    </section>
-  </main>
-
-  <script>
-    const form = document.getElementById("uploadForm");
-    const fileInput = document.getElementById("pdfFile");
-    const fileName = document.getElementById("fileName");
-    const startBtn = document.getElementById("startBtn");
-    const statusText = document.getElementById("statusText");
-    const percentText = document.getElementById("percentText");
-    const progressBar = document.getElementById("progressBar");
-    const logs = document.getElementById("logs");
-    const reader = document.getElementById("reader");
-    const readerHint = document.getElementById("readerHint");
-    const markdownView = document.getElementById("markdownView");
-    const dropZone = document.getElementById("dropZone");
-
-    let activeJob = null;
-    let pollTimer = null;
-
-    function setProgress(percent, text) {
-      const safe = Math.max(0, Math.min(100, Number(percent) || 0));
-      progressBar.style.width = `${safe}%`;
-      percentText.textContent = `${Math.round(safe)}%`;
-      if (text) statusText.textContent = text;
-    }
-
-    function setFile(file) {
-      if (!file) return;
-      const dataTransfer = new DataTransfer();
-      dataTransfer.items.add(file);
-      fileInput.files = dataTransfer.files;
-      fileName.textContent = `${file.name} · ${(file.size / 1024 / 1024).toFixed(2)} MB`;
-      startBtn.disabled = false;
-    }
-
-    fileInput.addEventListener("change", () => {
-      const file = fileInput.files[0];
-      if (!file) return;
-      fileName.textContent = `${file.name} · ${(file.size / 1024 / 1024).toFixed(2)} MB`;
-      startBtn.disabled = false;
-    });
-
-    ["dragenter", "dragover"].forEach((eventName) => {
-      dropZone.addEventListener(eventName, (event) => {
-        event.preventDefault();
-        dropZone.classList.add("dragging");
-      });
-    });
-
-    ["dragleave", "drop"].forEach((eventName) => {
-      dropZone.addEventListener(eventName, (event) => {
-        event.preventDefault();
-        dropZone.classList.remove("dragging");
-      });
-    });
-
-    dropZone.addEventListener("drop", (event) => {
-      const file = event.dataTransfer.files[0];
-      if (file) setFile(file);
-    });
-
-    form.addEventListener("submit", (event) => {
-      event.preventDefault();
-      const file = fileInput.files[0];
-      if (!file) return;
-      startUpload(file);
-    });
-
-    function startUpload(file) {
-      startBtn.disabled = true;
-      reader.classList.add("is-hidden");
-      markdownView.innerHTML = "";
-      logs.classList.remove("is-hidden");
-      logs.textContent = "";
-      setProgress(0, "正在上传 PDF");
-
-      const formData = new FormData();
-      formData.append("file", file);
-      const xhr = new XMLHttpRequest();
-      xhr.open("POST", "/api/jobs");
-      xhr.upload.onprogress = (event) => {
-        if (event.lengthComputable) {
-          setProgress(Math.round((event.loaded / event.total) * 8), "正在上传 PDF");
-        }
-      };
-      xhr.onload = () => {
-        if (xhr.status >= 200 && xhr.status < 300) {
-          activeJob = JSON.parse(xhr.responseText);
-          setProgress(activeJob.progress || 8, activeJob.message || "已提交 OCR 任务");
-          pollJob(activeJob.job_id);
-        } else {
-          setProgress(100, "上传失败");
-          startBtn.disabled = false;
-          logs.textContent = xhr.responseText || "上传失败";
-        }
-      };
-      xhr.onerror = () => {
-        setProgress(100, "网络错误");
-        startBtn.disabled = false;
-      };
-      xhr.send(formData);
-    }
-
-    async function pollJob(jobId) {
-      if (pollTimer) clearTimeout(pollTimer);
-      try {
-        const response = await fetch(`/api/jobs/${jobId}`);
-        const job = await response.json();
-        setProgress(job.progress, job.message);
-        if (job.total_pages) {
-          readerHint.textContent = `${job.file_name} · ${job.total_pages} 页`;
-        }
-        if (job.log_tail && job.log_tail.length) {
-          logs.textContent = job.log_tail.join("\\n");
-          logs.scrollTop = logs.scrollHeight;
-        }
-        if (job.state === "done") {
-          await loadMarkdown(job.markdown_url);
-          startBtn.disabled = false;
-          return;
-        }
-        if (job.state === "failed") {
-          setProgress(100, job.error || "处理失败");
-          startBtn.disabled = false;
-          return;
-        }
-        pollTimer = setTimeout(() => pollJob(jobId), 2000);
-      } catch (error) {
-        statusText.textContent = `轮询失败：${error.message}`;
-        pollTimer = setTimeout(() => pollJob(jobId), 4000);
-      }
-    }
-
-    async function loadMarkdown(url) {
-      const response = await fetch(url);
-      const markdown = await response.text();
-      if (window.marked && window.DOMPurify) {
-        markdownView.innerHTML = DOMPurify.sanitize(marked.parse(markdown));
-      } else {
-        markdownView.textContent = markdown;
-      }
-      reader.classList.remove("is-hidden");
-      reader.scrollIntoView({ behavior: "smooth", block: "start" });
-    }
-  </script>
-</body>
-</html>
-"""

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from typing import Any
 
 
@@ -53,6 +54,7 @@ class ExtractionResult:
     topic: str = ""
     relevance: str = ""
     reason: str = ""
+    created_at: str = field(default_factory=lambda: datetime.now().astimezone().isoformat(timespec="seconds"))
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:

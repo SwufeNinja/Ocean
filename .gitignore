@@ -14,4 +14,10 @@ config.yaml
 
 # Runtime outputs
 outputs/
+outputs_*/
 pdfs/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/vite-dev.*.log

@@ -1,28 +1,31 @@
 ocr:
-  engine: mineru
-  api_base_url: https://mineru.net
-  api_token: ${MINERU_API_TOKEN}
-  fallback_engine: paddleocr
+  engine: paddleocr
+  api_base_url: ${PADDLEOCR_API_BASE_URL}
+  api_token: ${PADDLEOCR_API_TOKEN}
+  fallback_engine: mineru
   output_markdown: true
   output_json: true
   options:
-    model_version: vlm
-    language: ch
-    is_ocr: true
-    enable_table: true
-    enable_formula: true
+    api_mode: official_hosted
+    model: PaddleOCR-VL-1.6
+    auth_scheme: bearer
+    timeout_seconds: 600
     poll_interval_seconds: 5
     max_wait_seconds: 1800
-    download_timeout_seconds: 120
-    max_pages_per_file: 200
+    download_timeout_seconds: 600
+    use_doc_orientation_classify: false
+    use_doc_unwarping: false
+    use_chart_recognition: false
+    max_pages_per_file: 10
 
 ocr_engines:
-  paddleocr:
-    api_base_url: ${PADDLEOCR_API_BASE_URL}
-    api_token: ${PADDLEOCR_API_TOKEN}
+  mineru:
+    api_base_url: https://mineru.net
+    api_token: ${MINERU_API_TOKEN}
     options:
-      model: PaddleOCR-VL-1.6
-      max_pages_per_file: 10
+      model_version: vlm
+      language: ch
+      max_pages_per_file: 200
 
 extraction:
   keywords:

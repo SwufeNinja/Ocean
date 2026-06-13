@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import copy
+import json
+import os
+import uuid
+from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -23,26 +28,174 @@ from ocean.pdf_utils import PdfPart, count_pdf_pages, split_pdf
 
 def run_ocr(input_path: str | Path, output_dir: str | Path, config: dict[str, Any]) -> list[OcrDocument]:
     ocr_config = config.get("ocr", {})
-    client = create_ocr_client(ocr_config)
     pdfs = list_pdfs(input_path)
     output = Path(output_dir) / "ocr"
+    report_path = output / "run_report.json"
     set_log_file(Path(output_dir) / "ocr_run.log")
     log(f"OCR task started. Input: {input_path}. PDFs found: {len(pdfs)}.")
+    report: dict[str, Any] = {
+        "run_id": uuid.uuid4().hex,
+        "input_path": str(Path(input_path).expanduser().resolve()),
+        "output_path": str(output.resolve()),
+        "started_at": _now(),
+        "finished_at": None,
+        "status": "processing",
+        "total_files": len(pdfs),
+        "success_count": 0,
+        "failed_count": 0,
+        "files": [],
+    }
+    _write_run_report(report, report_path)
+
+    primary_engine = str(ocr_config.get("engine") or "")
+    primary_client = create_ocr_client(ocr_config)
+    fallback_config = _fallback_ocr_config(config)
+    fallback_client = create_ocr_client(fallback_config) if fallback_config else None
     documents: list[OcrDocument] = []
     for index, pdf in enumerate(pdfs, start=1):
+        file_report: dict[str, Any] = {
+            "file_id": uuid.uuid5(uuid.NAMESPACE_URL, str(pdf.resolve())).hex,
+            "source_file": pdf.name,
+            "source_path": str(pdf.resolve()),
+            "status": "processing",
+            "page_count": None,
+            "started_at": _now(),
+            "finished_at": None,
+            "ocr_engine": None,
+            "fallback_used": False,
+            "attempts": [],
+            "outputs": {},
+            "error": None,
+        }
+        report["files"].append(file_report)
+        _write_run_report(report, report_path)
         log(f"[{index}/{len(pdfs)}] Start PDF: {pdf.name}")
-        document = _recognize_pdf_with_split(client, pdf, ocr_config)
-        documents.append(document)
-        stem = pdf.stem
-        if ocr_config.get("output_json", True):
-            write_ocr_json(document, output / f"{stem}.json")
-            log(f"[{index}/{len(pdfs)}] JSON exported: {output / f'{stem}.json'}")
-        if ocr_config.get("output_markdown", True):
-            write_ocr_markdown(document, output / f"{stem}.md")
-            log(f"[{index}/{len(pdfs)}] Markdown exported: {output / f'{stem}.md'}")
-        log(f"[{index}/{len(pdfs)}] Finished PDF: {pdf.name}")
-    log(f"OCR task finished. Documents: {len(documents)}.")
+        try:
+            file_report["page_count"] = count_pdf_pages(pdf)
+            document, used_engine, fallback_used = _recognize_with_fallback(
+                pdf=pdf,
+                primary_client=primary_client,
+                primary_config=ocr_config,
+                primary_engine=primary_engine,
+                fallback_client=fallback_client,
+                fallback_config=fallback_config,
+                file_report=file_report,
+            )
+            stem = pdf.stem
+            if ocr_config.get("output_json", True):
+                json_path = output / f"{stem}.json"
+                write_ocr_json(document, json_path)
+                file_report["outputs"]["json"] = str(json_path.resolve())
+                log(f"[{index}/{len(pdfs)}] JSON exported: {json_path}")
+            if ocr_config.get("output_markdown", True):
+                markdown_path = output / f"{stem}.md"
+                write_ocr_markdown(document, markdown_path)
+                file_report["outputs"]["markdown"] = str(markdown_path.resolve())
+                log(f"[{index}/{len(pdfs)}] Markdown exported: {markdown_path}")
+            documents.append(document)
+            file_report["status"] = "success"
+            file_report["ocr_engine"] = used_engine
+            file_report["fallback_used"] = fallback_used
+            report["success_count"] += 1
+            log(f"[{index}/{len(pdfs)}] Finished PDF: {pdf.name}")
+        except Exception as exc:
+            file_report["status"] = "failed"
+            file_report["error"] = str(exc)
+            report["failed_count"] += 1
+            log(f"[{index}/{len(pdfs)}] Failed PDF: {pdf.name}. Error: {exc}")
+        finally:
+            file_report["finished_at"] = _now()
+            _write_run_report(report, report_path)
+
+    report["finished_at"] = _now()
+    report["status"] = "success" if not report["failed_count"] else (
+        "failed" if not report["success_count"] else "partial_success"
+    )
+    _write_run_report(report, report_path)
+    log(
+        f"OCR task finished. Success: {report['success_count']}; "
+        f"failed: {report['failed_count']}; report: {report_path}."
+    )
     return documents
+
+
+def _recognize_with_fallback(
+    pdf: Path,
+    primary_client: Any,
+    primary_config: dict[str, Any],
+    primary_engine: str,
+    fallback_client: Any | None,
+    fallback_config: dict[str, Any] | None,
+    file_report: dict[str, Any],
+) -> tuple[OcrDocument, str, bool]:
+    try:
+        document = _recognize_pdf_with_split(primary_client, pdf, primary_config)
+        file_report["attempts"].append({"engine": primary_engine, "status": "success", "error": None})
+        return document, primary_engine, False
+    except Exception as primary_error:
+        file_report["attempts"].append(
+            {"engine": primary_engine, "status": "failed", "error": str(primary_error)}
+        )
+        if not fallback_client or not fallback_config:
+            raise
+
+        fallback_engine = str(fallback_config.get("engine") or "")
+        log(f"{pdf.name}: primary engine {primary_engine} failed; trying fallback engine {fallback_engine}.")
+        try:
+            document = _recognize_pdf_with_split(fallback_client, pdf, fallback_config)
+            file_report["attempts"].append({"engine": fallback_engine, "status": "success", "error": None})
+            return document, fallback_engine, True
+        except Exception as fallback_error:
+            file_report["attempts"].append(
+                {"engine": fallback_engine, "status": "failed", "error": str(fallback_error)}
+            )
+            raise RuntimeError(
+                f"Primary OCR engine {primary_engine} failed: {primary_error}; "
+                f"fallback engine {fallback_engine} failed: {fallback_error}"
+            ) from fallback_error
+
+
+def _fallback_ocr_config(config: dict[str, Any]) -> dict[str, Any] | None:
+    primary = config.get("ocr", {})
+    fallback_engine = str(primary.get("fallback_engine") or "").strip()
+    if not fallback_engine or fallback_engine.lower() == str(primary.get("engine") or "").lower():
+        return None
+
+    fallback = copy.deepcopy(primary)
+    engine_configs = config.get("ocr_engines", {})
+    fallback.update(copy.deepcopy(engine_configs.get(fallback_engine, {})))
+    fallback["engine"] = fallback_engine
+    fallback.pop("fallback_engine", None)
+    if fallback_engine.lower() in {"paddle", "paddleocr"}:
+        fallback["api_base_url"] = (
+            engine_configs.get(fallback_engine, {}).get("api_base_url")
+            or os.getenv("PADDLEOCR_API_BASE_URL")
+            or "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
+        )
+        fallback["api_token"] = (
+            engine_configs.get(fallback_engine, {}).get("api_token")
+            or os.getenv("PADDLEOCR_API_TOKEN", "")
+        )
+    elif fallback_engine.lower() in {"mineru", "mineruocr"}:
+        fallback["api_base_url"] = (
+            engine_configs.get(fallback_engine, {}).get("api_base_url")
+            or os.getenv("MINERU_API_BASE_URL")
+            or "https://mineru.net"
+        )
+        fallback["api_token"] = (
+            engine_configs.get(fallback_engine, {}).get("api_token")
+            or os.getenv("MINERU_API_TOKEN", "")
+        )
+    return fallback
+
+
+def _write_run_report(report: dict[str, Any], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _now() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
 def _recognize_pdf_with_split(client: Any, pdf: Path, ocr_config: dict[str, Any]) -> OcrDocument:
@@ -84,6 +237,11 @@ def run_keyword_extraction(ocr_dir: str | Path, output_dir: str | Path, config: 
                 match_mode=extraction_config.get("keyword_match_mode", "any"),
                 context_before=int(extraction_config.get("context_before_paragraphs", 0)),
                 context_after=int(extraction_config.get("context_after_paragraphs", 0)),
+                granularity=extraction_config.get("keyword_granularity", "paragraph"),
+                use_regex=bool(extraction_config.get("keyword_use_regex", False)),
+                case_sensitive=bool(extraction_config.get("keyword_case_sensitive", True)),
+                normalize_chinese=bool(extraction_config.get("keyword_normalize_chinese", False)),
+                deduplicate=bool(extraction_config.get("keyword_deduplicate", True)),
             )
         )
     _renumber_results(results, "K")
@@ -145,6 +303,7 @@ def _merge_part_documents(
                     "source_file": document.source_file,
                     "pages": [page.page_number for page in document.pages],
                     "mineru_result": document.metadata.get("mineru_result"),
+                    "ocr_metadata": document.metadata,
                 }
                 for document in part_documents
             ],
