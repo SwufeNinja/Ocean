@@ -91,8 +91,8 @@ def make_app(config: dict[str, Any], output_dir: str | Path = "./outputs"):
     frontend_dist = _frontend_dist_root()
     frontend_index = frontend_dist / "index.html"
     frontend_assets = frontend_dist / "assets"
-    if StaticFiles is not None and frontend_assets.exists():
-        app.mount("/assets", StaticFiles(directory=frontend_assets), name="assets")
+    if StaticFiles is not None:
+        app.mount("/assets", StaticFiles(directory=frontend_assets, check_dir=False), name="assets")
 
     output_root = Path(output_dir).expanduser().resolve()
     web_root = output_root / "web_jobs"
@@ -517,4 +517,3 @@ def _now() -> str:
 
 if __name__ == "__main__":
     main()
-

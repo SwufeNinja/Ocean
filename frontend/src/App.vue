@@ -1,12 +1,40 @@
 <template>
   <main class="shell">
-    <section class="hero">
+    <header class="workbench-head">
+      <div class="brand-block">
+        <span class="brand-mark">Ocean</span>
+        <div>
+          <h1>文档解析助手</h1>
+          <p>PDF OCR、Markdown 阅读和关键词提取集中处理</p>
+        </div>
+      </div>
+      <nav class="view-tabs" aria-label="工作台页面切换">
+        <button
+          v-for="item in viewItems"
+          :key="item.value"
+          class="view-tab"
+          :class="{ active: activeView === item.value }"
+          type="button"
+          @click="switchView(item.value)"
+        >
+          <span>{{ item.label }}</span>
+          <small>{{ item.description }}</small>
+        </button>
+      </nav>
+    </header>
+
+    <section v-if="activeView === 'upload'" class="hero">
       <div class="panel intro">
-        <span class="eyebrow">Ocean OCR Workbench</span>
-        <h1>上传 PDF，选择引擎，直接得到 Markdown。</h1>
+        <span class="eyebrow">Processing Flow</span>
+        <h2>解析流程</h2>
         <p class="lede">
-          这是面向网页端的第一版 Vue 工作台：默认使用 PaddleOCR，也可以切换 MinerU。处理完成后可在页面内阅读 Markdown，或一键下载 .md 文件。
+          选择 PDF 和解析引擎后开始处理。完成后自动进入阅读页，需要定位内容时再切到关键词提取。
         </p>
+        <div class="flow-steps" aria-label="解析流程">
+          <span>上传 PDF</span>
+          <span>选择引擎</span>
+          <span>阅读/提取</span>
+        </div>
       </div>
 
       <form class="panel upload" @submit.prevent="startUpload">
@@ -54,60 +82,68 @@
       </form>
     </section>
 
-    <section v-if="markdown" class="panel reader">
-      <div class="reader-head">
-        <div class="reader-title-block">
-          <h2>{{ readerTitle }}</h2>
-          <div class="hint">{{ readerHint }}</div>
-        </div>
-        <div v-if="currentKeywordLabel || currentSourcePageLabel" class="reader-meta-pills">
-          <div v-if="currentKeywordLabel" class="reader-page-source">命中关键词：{{ currentKeywordLabel }}</div>
-          <div v-if="currentSourcePageLabel" class="reader-page-source">原文页码：{{ currentSourcePageLabel }}</div>
-        </div>
-        <div class="reader-actions">
-          <div class="zoom-control" aria-label="阅读器缩放">
-            <button class="secondary" type="button" :disabled="readerZoom <= minReaderZoom" @click="adjustZoom(-10)">-</button>
-            <input
-              v-model.number="zoomInput"
-              type="number"
-              :min="minReaderZoom"
-              :max="maxReaderZoom"
-              step="10"
-              aria-label="缩放百分比"
-              @change="applyZoomInput"
-              @keyup.enter="applyZoomInput"
-            />
-            <span class="zoom-label">%</span>
-            <button class="secondary" type="button" :disabled="readerZoom >= maxReaderZoom" @click="adjustZoom(10)">+</button>
-            <button class="secondary" type="button" @click="resetZoom">100%</button>
+    <section v-else-if="activeView === 'reader'" class="panel reader">
+      <div v-if="markdown" class="reader-content">
+        <div class="reader-head">
+          <div class="reader-title-block">
+            <h2>{{ readerTitle }}</h2>
+            <div class="hint">{{ readerHint }}</div>
           </div>
-          <button class="secondary" type="button" @click="showRaw = !showRaw">{{ showRaw ? "预览模式" : "查看源码" }}</button>
-          <a v-if="downloadUrl" class="download-link" :href="downloadUrl">下载 Markdown</a>
+          <div v-if="currentKeywordLabel || currentSourcePageLabel" class="reader-meta-pills">
+            <div v-if="currentKeywordLabel" class="reader-page-source">命中关键词：{{ currentKeywordLabel }}</div>
+            <div v-if="currentSourcePageLabel" class="reader-page-source">原文页码：{{ currentSourcePageLabel }}</div>
+          </div>
+          <div class="reader-actions">
+            <div class="zoom-control" aria-label="阅读器缩放">
+              <button class="secondary" type="button" :disabled="readerZoom <= minReaderZoom" @click="adjustZoom(-10)">-</button>
+              <input
+                v-model.number="zoomInput"
+                type="number"
+                :min="minReaderZoom"
+                :max="maxReaderZoom"
+                step="10"
+                aria-label="缩放百分比"
+                @change="applyZoomInput"
+                @keyup.enter="applyZoomInput"
+              />
+              <span class="zoom-label">%</span>
+              <button class="secondary" type="button" :disabled="readerZoom >= maxReaderZoom" @click="adjustZoom(10)">+</button>
+              <button class="secondary" type="button" @click="resetZoom">100%</button>
+            </div>
+            <button class="secondary" type="button" @click="showRaw = !showRaw">{{ showRaw ? "预览模式" : "查看源码" }}</button>
+            <a v-if="downloadUrl" class="download-link" :href="downloadUrl">下载 Markdown</a>
+          </div>
+        </div>
+        <div ref="readingFrame" class="reading-frame" :style="readerZoomStyle">
+          <textarea v-if="showRaw" class="raw-box" :value="currentDisplayMarkdown" readonly></textarea>
+          <article v-else class="markdown" v-html="renderedMarkdown"></article>
+        </div>
+        <div v-if="hasPageItems" class="page-nav">
+          <button class="secondary" type="button" :disabled="currentPage <= 1" @click="goToPreviousPage">上一页</button>
+          <input
+            v-model.number="pageInput"
+            type="number"
+            min="1"
+            :max="totalReaderPages"
+            aria-label="当前页码"
+            @change="jumpToPage"
+            @keyup.enter="jumpToPage"
+          />
+          <span>/ {{ totalReaderPages }}</span>
+          <button class="secondary" type="button" :disabled="currentPage >= totalReaderPages" @click="goToNextPage">下一页</button>
         </div>
       </div>
-      <div ref="readingFrame" class="reading-frame" :style="readerZoomStyle">
-        <textarea v-if="showRaw" class="raw-box" :value="currentDisplayMarkdown" readonly></textarea>
-        <article v-else class="markdown" v-html="renderedMarkdown"></article>
-      </div>
-      <div v-if="hasPageItems" class="page-nav">
-        <button class="secondary" type="button" :disabled="currentPage <= 1" @click="goToPreviousPage">上一页</button>
-        <input
-          v-model.number="pageInput"
-          type="number"
-          min="1"
-          :max="totalReaderPages"
-          aria-label="当前页码"
-          @change="jumpToPage"
-          @keyup.enter="jumpToPage"
-        />
-        <span>/ {{ totalReaderPages }}</span>
-        <button class="secondary" type="button" :disabled="currentPage >= totalReaderPages" @click="goToNextPage">下一页</button>
+      <div v-else class="empty-state">
+        <span class="empty-kicker">Markdown Reader</span>
+        <h2>还没有可阅读的 Markdown。</h2>
+        <p>先在“上传解析”页完成 OCR，处理成功后这里会显示分页阅读器和下载入口。</p>
+        <button type="button" @click="switchView('upload')">去上传解析</button>
       </div>
     </section>
 
-    <section v-if="markdown" class="panel extractor">
-      <div class="extractor-grid">
-        <div>
+    <section v-else class="panel extractor">
+      <div v-if="markdown" class="extractor-grid">
+        <div class="extractor-form">
           <h2>关键词段落提取</h2>
           <p class="hint">复用后端同一套关键词匹配算法。当前是包含匹配：段落里出现关键词即命中。</p>
           <div class="field">
@@ -152,9 +188,17 @@
           <div class="extract-status">{{ keywordStatus }}</div>
         </div>
 
-        <div>
-          <div class="hint">提取完成后，结果会切换到上方 Markdown 阅读器展示；原 OCR Markdown 不再占用阅读区。</div>
+        <div class="extractor-note">
+          <span class="empty-kicker">Extraction</span>
+          <h3>结果会进入阅读页</h3>
+          <p class="hint">提取完成后，页面会自动切到“Markdown 阅读”，逐条展示命中内容；原 OCR Markdown 不再占用阅读区。</p>
         </div>
+      </div>
+      <div v-else class="empty-state">
+        <span class="empty-kicker">Keyword Extractor</span>
+        <h2>请先生成 OCR Markdown。</h2>
+        <p>关键词提取依赖当前 OCR 任务。完成解析后再进入这里配置关键词、匹配模式和上下文段落。</p>
+        <button type="button" @click="switchView('upload')">去上传解析</button>
       </div>
     </section>
   </main>
@@ -185,11 +229,20 @@ interface ReaderPageItem {
   sourcePageLabel?: string;
 }
 
+type ActiveView = "upload" | "reader" | "extractor";
+
+interface ViewItem {
+  value: ActiveView;
+  label: string;
+  description: string;
+}
+
 const defaultEngines: EngineOption[] = [
   { value: "paddleocr", label: "PaddleOCR", description: "默认：适合快速文档 OCR" },
   { value: "mineru", label: "MinerU", description: "适合版面复杂的长文档解析" }
 ];
 
+const activeView = ref<ActiveView>("upload");
 const engines = ref<EngineOption[]>(defaultEngines);
 const engine = ref("paddleocr");
 const file = ref<File | null>(null);
@@ -230,6 +283,23 @@ const isExtracting = ref(false);
 const fileInput = ref<HTMLInputElement | null>(null);
 const readingFrame = ref<HTMLDivElement | null>(null);
 
+const viewItems = computed<ViewItem[]>(() => [
+  {
+    value: "upload",
+    label: "上传解析",
+    description: isBusy.value ? "处理中" : file.value ? "已选择文件" : "选择 PDF"
+  },
+  {
+    value: "reader",
+    label: "Markdown 阅读",
+    description: markdown.value ? "可阅读" : "等待结果"
+  },
+  {
+    value: "extractor",
+    label: "关键词提取",
+    description: markdown.value ? "可提取" : "等待 OCR"
+  }
+]);
 const fileSummary = computed(() => {
   if (!file.value) return "还没有选择文件";
   return `${file.value.name} / ${(file.value.size / 1024 / 1024).toFixed(2)} MB`;
@@ -276,6 +346,11 @@ function resetReader() {
   pageInput.value = 1;
 }
 
+function switchView(view: ActiveView) {
+  activeView.value = view;
+  if (view === "reader") scrollReaderToTop();
+}
+
 function setZoom(value: number) {
   const normalized = Math.round((Number(value) || 100) / 10) * 10;
   const clamped = Math.max(minReaderZoom, Math.min(maxReaderZoom, normalized));
@@ -317,6 +392,7 @@ function onDrop(event: DragEvent) {
 
 function setFile(selectedFile: File | null) {
   if (!selectedFile) return;
+  activeView.value = "upload";
   file.value = selectedFile;
   resetReader();
   readerTitle.value = "Markdown 阅读器";
@@ -334,6 +410,7 @@ function setFile(selectedFile: File | null) {
 
 async function startUpload() {
   if (!file.value || isBusy.value) return;
+  activeView.value = "upload";
   isBusy.value = true;
   progress.value = 0;
   statusText.value = "正在上传 PDF";
@@ -394,8 +471,9 @@ async function loadMarkdown(url: string, pagesUrl?: string | null) {
   pageInput.value = 1;
   readerTitle.value = "OCR Markdown 阅读器";
   showRaw.value = false;
-  scrollReaderToTop();
+  activeView.value = "reader";
   await nextTick();
+  scrollReaderToTop();
   document.querySelector(".reader")?.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
@@ -466,7 +544,9 @@ async function extractKeywordResults() {
     readerTitle.value = "关键词提取结果";
     showRaw.value = false;
     keywordStatus.value = `命中 ${data.count || 0} 条结果；匹配模式：${data.match_mode}。`;
+    activeView.value = "reader";
     await nextTick();
+    scrollReaderToTop();
     document.querySelector(".reader")?.scrollIntoView({ behavior: "smooth", block: "start" });
   } catch (error) {
     keywordResults.value = [];
