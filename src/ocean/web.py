@@ -381,6 +381,7 @@ def _web_ocr_config(config: dict[str, Any], engine: str) -> dict[str, Any]:
         # single CLI-oriented config block so both providers can coexist.
         ocr_config["api_base_url"] = ""
         ocr_config["api_token"] = ""
+        ocr_config["options"] = {}
 
     ocr_config["engine"] = engine
     ocr_config["output_json"] = False
@@ -401,7 +402,7 @@ def _web_ocr_config(config: dict[str, Any], engine: str) -> dict[str, Any]:
         options.setdefault("poll_interval_seconds", 5)
         options.setdefault("max_wait_seconds", 1800)
         options.setdefault("download_timeout_seconds", 600)
-        options.setdefault("max_pages_per_file", 10)
+        options.setdefault("max_pages_per_file", 50)
     elif engine == "mineru":
         ocr_config["api_base_url"] = ocr_config.get("api_base_url") or os.getenv("MINERU_API_BASE_URL") or "https://mineru.net"
         ocr_config["api_token"] = ocr_config.get("api_token") or os.getenv("MINERU_API_TOKEN", "")

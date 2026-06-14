@@ -14,6 +14,31 @@ from ocean.models import OcrBlock, OcrDocument, OcrPage
 from ocean.ocr.base import OcrClient
 
 
+_RETRYABLE_PADDLE_ERROR_CODES = {10010, 12002}
+_RETRYABLE_HTTP_STATUS_CODES = {429, 500, 502, 503, 504}
+
+
+class PaddleOcrHttpError(RuntimeError):
+    """HTTP error returned by the PaddleOCR hosted API."""
+
+    def __init__(
+        self,
+        status_code: int,
+        body: str,
+        error_code: int | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        self.status_code = status_code
+        self.body = body
+        self.error_code = error_code
+        self.error_message = error_message
+        super().__init__(f"PaddleOCR HTTP {status_code}: {body}")
+
+    @property
+    def is_retryable(self) -> bool:
+        return self.status_code in _RETRYABLE_HTTP_STATUS_CODES or self.error_code in _RETRYABLE_PADDLE_ERROR_CODES
+
+
 class PaddleOcrClient(OcrClient):
     """PaddleOCR official hosted async Job API client."""
 
@@ -64,12 +89,14 @@ class PaddleOcrClient(OcrClient):
         headers["Accept"] = "application/json"
         self._add_auth_header(headers, options)
 
-        data = self._request_json(
+        data = self._request_json_with_retries(
             self.api_base_url,
             method="POST",
             body=body,
             headers=headers,
             timeout=int(options.get("timeout_seconds", 600)),
+            options=options,
+            operation=f"submit {pdf.name}",
         )
         try:
             return str(data["data"]["jobId"])
@@ -85,12 +112,14 @@ class PaddleOcrClient(OcrClient):
         while time.time() < deadline:
             headers = {"Accept": "application/json"}
             self._add_auth_header(headers, options)
-            data = self._request_json(
+            data = self._request_json_with_retries(
                 f"{self.api_base_url}/{job_id}",
                 method="GET",
                 body=None,
                 headers=headers,
                 timeout=int(options.get("timeout_seconds", 600)),
+                options=options,
+                operation=f"poll job {job_id}",
             )
             job_data = data.get("data", {})
             last_data = job_data
@@ -120,7 +149,47 @@ class PaddleOcrClient(OcrClient):
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             error_body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"PaddleOCR HTTP {exc.code}: {error_body}") from exc
+            error_code, error_message = _parse_paddle_error_body(error_body)
+            raise PaddleOcrHttpError(exc.code, error_body, error_code, error_message) from exc
+
+    def _request_json_with_retries(
+        self,
+        url: str,
+        method: str,
+        body: bytes | None,
+        headers: dict[str, str],
+        timeout: int,
+        options: dict[str, Any],
+        operation: str,
+    ) -> dict[str, Any]:
+        initial_delay = int(options.get("retry_initial_delay_seconds", 30))
+        max_delay = int(options.get("retry_max_delay_seconds", 300))
+        max_wait = int(options.get("retry_max_wait_seconds", 1800))
+        deadline = time.time() + max_wait
+        delay = max(initial_delay, 1)
+        attempt = 1
+
+        while True:
+            try:
+                return self._request_json(url, method=method, body=body, headers=headers, timeout=timeout)
+            except PaddleOcrHttpError as exc:
+                remaining_wait = deadline - time.time()
+                if not exc.is_retryable or remaining_wait <= 0:
+                    raise
+
+                sleep_seconds = min(delay, max_delay, int(remaining_wait))
+                if sleep_seconds <= 0:
+                    raise
+
+                code_text = f" code={exc.error_code}" if exc.error_code is not None else ""
+                message_text = f" msg={exc.error_message}" if exc.error_message else ""
+                log(
+                    f"PaddleOCR: retryable HTTP {exc.status_code}{code_text}{message_text} "
+                    f"during {operation}; retrying in {sleep_seconds}s (attempt {attempt})."
+                )
+                time.sleep(sleep_seconds)
+                delay = min(delay * 2, max_delay)
+                attempt += 1
 
     def _download_text(self, url: str, timeout: int) -> str:
         with urllib.request.urlopen(url, timeout=timeout) as response:
@@ -148,6 +217,22 @@ def _optional_payload(options: dict[str, Any]) -> dict[str, Any]:
     if "api_extra_payload" in options and isinstance(options["api_extra_payload"], dict):
         payload.update(options["api_extra_payload"])
     return payload
+
+
+def _parse_paddle_error_body(body: str) -> tuple[int | None, str | None]:
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return None, None
+    error_code = payload.get("code")
+    if isinstance(error_code, str) and error_code.isdigit():
+        error_code = int(error_code)
+    if not isinstance(error_code, int):
+        error_code = None
+    error_message = payload.get("msg")
+    if not isinstance(error_message, str):
+        error_message = None
+    return error_code, error_message
 
 
 def _encode_multipart_form(

@@ -13,10 +13,13 @@ ocr:
     poll_interval_seconds: 5
     max_wait_seconds: 1800
     download_timeout_seconds: 600
+    retry_initial_delay_seconds: 30
+    retry_max_delay_seconds: 300
+    retry_max_wait_seconds: 1800
     use_doc_orientation_classify: false
     use_doc_unwarping: false
     use_chart_recognition: false
-    max_pages_per_file: 10
+    max_pages_per_file: 50
 
 ocr_engines:
   mineru:

@@ -75,6 +75,16 @@ export interface KeywordExtractionResponse {
   results: KeywordResult[];
 }
 
+export class ApiError extends Error {
+  status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
 export async function listEngines(): Promise<EnginesResponse> {
   return fetchJson<EnginesResponse>("/api/engines");
 }
@@ -154,7 +164,7 @@ async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
   const text = await response.text();
   const data = text ? JSON.parse(text) : null;
   if (!response.ok) {
-    throw new Error(readErrorPayload(data) || response.statusText || "请求失败");
+    throw new ApiError(response.status, readErrorPayload(data) || response.statusText || "请求失败");
   }
   return data as T;
 }

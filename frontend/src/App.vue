@@ -89,7 +89,8 @@
             <h2>{{ readerTitle }}</h2>
             <div class="hint">{{ readerHint }}</div>
           </div>
-          <div v-if="currentKeywordLabel || currentSourcePageLabel" class="reader-meta-pills">
+          <div v-if="isKeywordResultView && (currentKeywordLabel || currentSourcePageLabel)" class="reader-meta-pills">
+            <button class="secondary reader-original-button" type="button" @click="restoreOriginalDocument">查看原文</button>
             <div v-if="currentKeywordLabel" class="reader-page-source">命中关键词：{{ currentKeywordLabel }}</div>
             <div v-if="currentSourcePageLabel" class="reader-page-source">原文页码：{{ currentSourcePageLabel }}</div>
           </div>
@@ -210,6 +211,7 @@ import type { CSSProperties } from "vue";
 import DOMPurify from "dompurify";
 import { marked } from "marked";
 import {
+  ApiError,
   createJob,
   extractKeywords,
   getJob,
@@ -227,6 +229,14 @@ interface ReaderPageItem {
   markdown: string;
   keywordLabel?: string;
   sourcePageLabel?: string;
+  sourcePageNumber?: number;
+}
+
+interface OriginalReaderState {
+  markdown: string;
+  displayMarkdown: string;
+  pageItems: ReaderPageItem[];
+  readerTitle: string;
 }
 
 type ActiveView = "upload" | "reader" | "extractor";
@@ -256,9 +266,11 @@ const statusText = ref("等待上传");
 const logs = ref<string[]>([]);
 const markdown = ref("");
 const displayMarkdown = ref("");
+const originalReaderState = ref<OriginalReaderState | null>(null);
 const readerTitle = ref("Markdown 阅读器");
 const downloadUrl = ref("");
 const showRaw = ref(false);
+const isKeywordResultView = ref(false);
 const readerZoom = ref(100);
 const zoomInput = ref(100);
 const minReaderZoom = 50;
@@ -341,6 +353,8 @@ function clearPollTimer() {
 function resetReader() {
   markdown.value = "";
   displayMarkdown.value = "";
+  originalReaderState.value = null;
+  isKeywordResultView.value = false;
   pageItems.value = [];
   currentPage.value = 1;
   pageInput.value = 1;
@@ -457,6 +471,13 @@ async function pollJob(jobId: string) {
     }
     pollTimer = window.setTimeout(() => void pollJob(jobId), 2000);
   } catch (error) {
+    if (error instanceof ApiError && error.status === 404) {
+      if (activeJob.value?.job_id === jobId) activeJob.value = null;
+      isBusy.value = false;
+      logs.value = [];
+      setProgress(0, "任务不存在或服务已重启，请重新上传 PDF");
+      return;
+    }
     statusText.value = `轮询失败：${getErrorMessage(error)}`;
     pollTimer = window.setTimeout(() => void pollJob(jobId), 4000);
   }
@@ -465,6 +486,8 @@ async function pollJob(jobId: string) {
 async function loadMarkdown(url: string, pagesUrl?: string | null) {
   markdown.value = await getMarkdown(url);
   displayMarkdown.value = stripPageHeadings(markdown.value);
+  originalReaderState.value = null;
+  isKeywordResultView.value = false;
   pageItems.value = [];
   if (pagesUrl) await loadPageItems(pagesUrl);
   currentPage.value = 1;
@@ -537,11 +560,13 @@ async function extractKeywordResults() {
       deduplicate: keywordDeduplicate.value
     });
     keywordResults.value = data.results || [];
+    saveOriginalReaderState();
     pageItems.value = buildKeywordPageItems(data);
     currentPage.value = 1;
     pageInput.value = 1;
     displayMarkdown.value = stripPageHeadings(data.markdown || buildKeywordMarkdown(data));
     readerTitle.value = "关键词提取结果";
+    isKeywordResultView.value = true;
     showRaw.value = false;
     keywordStatus.value = `命中 ${data.count || 0} 条结果；匹配模式：${data.match_mode}。`;
     activeView.value = "reader";
@@ -572,8 +597,36 @@ function buildKeywordPageItems(data: KeywordExtractionResponse): ReaderPageItem[
     pageNumber: index + 1,
     markdown: stripPageHeadings(item.text || ""),
     keywordLabel: (item.matched_keywords || []).join("、") || "无",
-    sourcePageLabel: pageLabel(item)
+    sourcePageLabel: pageLabel(item),
+    sourcePageNumber: item.page_start
   }));
+}
+
+function saveOriginalReaderState() {
+  if (isKeywordResultView.value || originalReaderState.value) return;
+  originalReaderState.value = {
+    markdown: markdown.value,
+    displayMarkdown: displayMarkdown.value,
+    pageItems: pageItems.value.map((item) => ({ ...item })),
+    readerTitle: readerTitle.value
+  };
+}
+
+async function restoreOriginalDocument() {
+  const original = originalReaderState.value;
+  const sourcePage = currentPageItem.value?.sourcePageNumber || 1;
+  if (!original) return;
+
+  markdown.value = original.markdown;
+  displayMarkdown.value = original.displayMarkdown;
+  pageItems.value = original.pageItems.map((item) => ({ ...item }));
+  readerTitle.value = original.readerTitle || "OCR Markdown 阅读器";
+  isKeywordResultView.value = false;
+  showRaw.value = false;
+  activeView.value = "reader";
+  setReaderPage(sourcePage);
+  await nextTick();
+  document.querySelector(".reader")?.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
 function buildKeywordMarkdown(data: KeywordExtractionResponse) {

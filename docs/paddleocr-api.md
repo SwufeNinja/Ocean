@@ -23,6 +23,10 @@ ocr:
     api_mode: official_hosted
     model: PaddleOCR-VL-1.6
     auth_scheme: bearer
+    retry_initial_delay_seconds: 30
+    retry_max_delay_seconds: 300
+    retry_max_wait_seconds: 1800
+    max_pages_per_file: 50
     use_doc_orientation_classify: false
     use_doc_unwarping: false
     use_chart_recognition: false
@@ -54,6 +58,17 @@ Options in YAML are mapped to the official `optionalPayload` camelCase fields:
 - `use_region_detection` -> `useRegionDetection`
 
 If the API needs extra custom fields, put them under `api_extra_payload`.
+
+## Retry behavior
+
+The PaddleOCR client retries transient hosted API back-pressure errors with exponential backoff:
+
+- PaddleOCR error codes `10010` (task queue full) and `12002` (request frequency too high)
+- HTTP status codes `429`, `500`, `502`, `503`, and `504`
+
+The default waits are `30s`, `60s`, `120s`, then capped at `300s`, with up to `1800s` total retry wait.
+Large PDFs are split by `ocr.options.max_pages_per_file`; the PaddleOCR default is `50` pages per part to reduce
+the number of hosted job submissions while staying below the documented 100-page recommendation.
 
 ## Run
 
