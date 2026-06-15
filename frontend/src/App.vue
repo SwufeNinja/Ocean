@@ -1,43 +1,23 @@
 <template>
   <main class="shell">
-    <header class="workbench-head">
-      <div class="brand-block">
-        <span class="brand-mark">Ocean</span>
-        <div>
-          <h1>文档解析助手</h1>
-          <p>PDF OCR、Markdown 阅读和关键词提取集中处理</p>
-        </div>
-      </div>
-      <nav class="view-tabs" aria-label="工作台页面切换">
-        <button
-          v-for="item in viewItems"
-          :key="item.value"
-          class="view-tab"
-          :class="{ active: activeView === item.value }"
-          type="button"
-          @click="switchView(item.value)"
-        >
-          <span>{{ item.label }}</span>
-          <small>{{ item.description }}</small>
-        </button>
-      </nav>
-    </header>
+    <nav class="view-tabs" aria-label="工作台页面切换">
+      <button
+        v-for="item in viewItems"
+        :key="item.value"
+        class="view-tab"
+        :class="{ active: activeView === item.value }"
+        type="button"
+        :aria-label="item.label"
+        :title="item.label"
+        @click="switchView(item.value)"
+      >
+        <component :is="item.icon" :size="21" :stroke-width="1.9" aria-hidden="true" />
+      </button>
+    </nav>
 
-    <section v-if="activeView === 'upload'" class="hero">
-      <div class="panel intro">
-        <span class="eyebrow">Processing Flow</span>
-        <h2>解析流程</h2>
-        <p class="lede">
-          选择 PDF 和解析引擎后开始处理。完成后自动进入阅读页，需要定位内容时再切到关键词提取。
-        </p>
-        <div class="flow-steps" aria-label="解析流程">
-          <span>上传 PDF</span>
-          <span>选择引擎</span>
-          <span>阅读/提取</span>
-        </div>
-      </div>
-
-      <form class="panel upload" @submit.prevent="startUpload">
+    <div class="workspace">
+      <section v-if="activeView === 'upload'" class="upload-page">
+      <form class="upload" @submit.prevent="startUpload">
         <label
           class="drop"
           :class="{ dragging }"
@@ -52,7 +32,18 @@
             或点击选择文件；大 PDF 会按当前引擎配置自动分段处理
           </span>
         </label>
-        <input id="pdfFile" ref="fileInput" name="file" type="file" accept="application/pdf,.pdf" @change="onFileChange" />
+        <input id="pdfFile" ref="fileInput" name="file" type="file" accept="application/pdf,.pdf" multiple @change="onFileChange" />
+        <input
+          id="folderInput"
+          ref="folderInput"
+          name="folder"
+          type="file"
+          accept="application/pdf,.pdf"
+          multiple
+          webkitdirectory
+          directory
+          @change="onFolderChange"
+        />
 
         <div class="field">
           <label class="field-label">OCR 引擎</label>
@@ -67,7 +58,9 @@
 
         <div class="actions">
           <label class="file-button" for="pdfFile">选择 PDF</label>
-          <button id="startBtn" type="submit" :disabled="!file || isBusy">{{ isBusy ? "处理中..." : "开始解析" }}</button>
+          <label class="file-button" for="folderInput">选择文件夹</label>
+          <button id="startBtn" type="submit" :disabled="!selectedFiles.length || isBusy">{{ isBusy ? "处理中..." : "开始解析" }}</button>
+          <button v-if="selectedFiles.length && !isBusy" class="secondary" type="button" @click="clearSelectedFiles">清空列表</button>
           <span class="file-name">{{ fileSummary }}</span>
         </div>
 
@@ -79,15 +72,44 @@
           <div class="bar"><i :style="{ width: progress + '%' }"></i></div>
           <div v-if="logs.length" class="logs">{{ logs.join("\n") }}</div>
         </div>
-      </form>
-    </section>
 
-    <section v-else-if="activeView === 'reader'" class="panel reader">
+        <div v-if="selectedFiles.length && !activeJobs.length" class="job-list pending-list" aria-label="待处理文件">
+          <div v-for="(item, index) in selectedFiles" :key="fileKey(item)" class="job-item pending">
+            <span>{{ index + 1 }}/{{ selectedFiles.length }}</span>
+            <small>{{ filePath(item) }} / {{ pendingFileDetail(item) }}</small>
+            <button class="remove-file" type="button" :aria-label="`移除 ${filePath(item)}`" title="移除" @click="removeSelectedFile(index)">×</button>
+          </div>
+        </div>
+
+        <div v-if="activeJobs.length" class="job-list" aria-label="OCR 任务队列">
+          <button
+            v-for="item in activeJobs"
+            :key="item.job_id"
+            class="job-item"
+            :class="{ active: activeJob?.job_id === item.job_id, done: item.state === 'done', failed: item.state === 'failed' }"
+            type="button"
+            @click="selectJob(item, { openReader: item.state === 'done' })"
+          >
+            <span>{{ queueLabel(item) }}</span>
+            <small>{{ item.file_name }} / {{ jobStateLabel(item) }}</small>
+          </button>
+        </div>
+      </form>
+      </section>
+
+      <section v-else-if="activeView === 'reader'" class="reader">
       <div v-if="markdown" class="reader-content">
         <div class="reader-head">
-          <div class="reader-title-block">
-            <h2>{{ readerTitle }}</h2>
-            <div class="hint">{{ readerHint }}</div>
+          <div v-if="activeJobs.length" class="document-switcher reader-document-switcher" aria-label="当前文档">
+            <label class="document-select-label" for="readerDocumentSelect">当前文档</label>
+            <select id="readerDocumentSelect" class="document-select" :value="activeJobId || ''" @change="onDocumentChange">
+              <option v-for="item in activeJobs" :key="item.job_id" :value="item.job_id">
+                {{ documentOptionLabel(item) }}
+              </option>
+            </select>
+            <span v-if="activeJob" class="document-state" :class="documentStateClass(activeJob)">
+              {{ jobStateLabel(activeJob) }}
+            </span>
           </div>
           <div v-if="isKeywordResultView && (currentKeywordLabel || currentSourcePageLabel)" class="reader-meta-pills">
             <button class="secondary reader-original-button" type="button" @click="restoreOriginalDocument">查看原文</button>
@@ -135,14 +157,36 @@
         </div>
       </div>
       <div v-else class="empty-state">
+        <div v-if="activeJobs.length" class="document-switcher reader-document-switcher" aria-label="当前文档">
+          <label class="document-select-label" for="readerEmptyDocumentSelect">当前文档</label>
+          <select id="readerEmptyDocumentSelect" class="document-select" :value="activeJobId || ''" @change="onDocumentChange">
+            <option v-for="item in activeJobs" :key="item.job_id" :value="item.job_id">
+              {{ documentOptionLabel(item) }}
+            </option>
+          </select>
+          <span v-if="activeJob" class="document-state" :class="documentStateClass(activeJob)">
+            {{ jobStateLabel(activeJob) }}
+          </span>
+        </div>
         <span class="empty-kicker">Markdown Reader</span>
         <h2>还没有可阅读的 Markdown。</h2>
         <p>先在“上传解析”页完成 OCR，处理成功后这里会显示分页阅读器和下载入口。</p>
         <button type="button" @click="switchView('upload')">去上传解析</button>
       </div>
-    </section>
+      </section>
 
-    <section v-else class="panel extractor">
+      <section v-else class="extractor">
+      <div v-if="activeJobs.length" class="document-switcher" aria-label="当前文档">
+        <label class="document-select-label" for="extractorDocumentSelect">当前文档</label>
+        <select id="extractorDocumentSelect" class="document-select" :value="activeJobId || ''" @change="onDocumentChange">
+          <option v-for="item in activeJobs" :key="item.job_id" :value="item.job_id">
+            {{ documentOptionLabel(item) }}
+          </option>
+        </select>
+        <span v-if="activeJob" class="document-state" :class="documentStateClass(activeJob)">
+          {{ jobStateLabel(activeJob) }}
+        </span>
+      </div>
       <div v-if="markdown" class="extractor-grid">
         <div class="extractor-form">
           <h2>关键词段落提取</h2>
@@ -182,37 +226,32 @@
             <label><input v-model="keywordDeduplicate" type="checkbox" /> 去重合并</label>
           </div>
           <div class="actions">
-            <button type="button" :disabled="isExtracting || !activeJob" @click="extractKeywordResults">
+            <button type="button" :disabled="isExtracting || activeJob?.state !== 'done'" @click="extractKeywordResults">
               {{ isExtracting ? "提取中..." : "提取关键词" }}
             </button>
           </div>
           <div class="extract-status">{{ keywordStatus }}</div>
         </div>
-
-        <div class="extractor-note">
-          <span class="empty-kicker">Extraction</span>
-          <h3>结果会进入阅读页</h3>
-          <p class="hint">提取完成后，页面会自动切到“Markdown 阅读”，逐条展示命中内容；原 OCR Markdown 不再占用阅读区。</p>
-        </div>
       </div>
       <div v-else class="empty-state">
-        <span class="empty-kicker">Keyword Extractor</span>
+        <span class="empty-kicker">关键词提取</span>
         <h2>请先生成 OCR Markdown。</h2>
         <p>关键词提取依赖当前 OCR 任务。完成解析后再进入这里配置关键词、匹配模式和上下文段落。</p>
         <button type="button" @click="switchView('upload')">去上传解析</button>
       </div>
-    </section>
+      </section>
+    </div>
   </main>
 </template>
 
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
-import type { CSSProperties } from "vue";
+import type { Component, CSSProperties } from "vue";
+import { BookOpen, Search, Upload } from "@lucide/vue";
 import DOMPurify from "dompurify";
 import { marked } from "marked";
 import {
-  ApiError,
-  createJob,
+  createJobs,
   extractKeywords,
   getJob,
   getMarkdown,
@@ -244,21 +283,22 @@ type ActiveView = "upload" | "reader" | "extractor";
 interface ViewItem {
   value: ActiveView;
   label: string;
-  description: string;
+  icon: Component;
 }
 
 const defaultEngines: EngineOption[] = [
-  { value: "paddleocr", label: "PaddleOCR", description: "默认：适合快速文档 OCR" },
-  { value: "mineru", label: "MinerU", description: "适合版面复杂的长文档解析" }
+  { value: "mineru", label: "MinerU", description: "默认：适合版面复杂的长文档解析" },
+  { value: "paddleocr", label: "PaddleOCR", description: "适合快速文档 OCR" }
 ];
 
 const activeView = ref<ActiveView>("upload");
 const engines = ref<EngineOption[]>(defaultEngines);
-const engine = ref("paddleocr");
-const file = ref<File | null>(null);
+const engine = ref("mineru");
+const selectedFiles = ref<File[]>([]);
 const dragging = ref(false);
 const isBusy = ref(false);
-const activeJob = ref<WebJob | null>(null);
+const activeJobs = ref<WebJob[]>([]);
+const activeJobId = ref<string | null>(null);
 let pollTimer: number | undefined;
 
 const progress = ref(0);
@@ -293,30 +333,36 @@ const keywordStatus = ref("OCR 完成后可以在这里提取关键词段落。"
 const isExtracting = ref(false);
 
 const fileInput = ref<HTMLInputElement | null>(null);
+const folderInput = ref<HTMLInputElement | null>(null);
 const readingFrame = ref<HTMLDivElement | null>(null);
 
 const viewItems = computed<ViewItem[]>(() => [
   {
     value: "upload",
     label: "上传解析",
-    description: isBusy.value ? "处理中" : file.value ? "已选择文件" : "选择 PDF"
+    icon: Upload
   },
   {
     value: "reader",
     label: "Markdown 阅读",
-    description: markdown.value ? "可阅读" : "等待结果"
+    icon: BookOpen
   },
   {
     value: "extractor",
     label: "关键词提取",
-    description: markdown.value ? "可提取" : "等待 OCR"
+    icon: Search
   }
 ]);
 const fileSummary = computed(() => {
-  if (!file.value) return "还没有选择文件";
-  return `${file.value.name} / ${(file.value.size / 1024 / 1024).toFixed(2)} MB`;
+  if (!selectedFiles.value.length) return "还没有选择文件";
+  const totalSize = selectedFiles.value.reduce((sum, item) => sum + item.size, 0);
+  if (selectedFiles.value.length === 1) {
+    return `${filePath(selectedFiles.value[0])} / ${(totalSize / 1024 / 1024).toFixed(2)} MB`;
+  }
+  return `${selectedFiles.value.length} 个 PDF / ${(totalSize / 1024 / 1024).toFixed(2)} MB`;
 });
 const roundedProgress = computed(() => Math.round(progress.value));
+const activeJob = computed(() => activeJobs.value.find((item) => item.job_id === activeJobId.value) || null);
 const readerHint = computed(() => {
   if (!activeJob.value) return "处理完成后会自动显示";
   const pages = activeJob.value.total_pages ? ` / ${activeJob.value.total_pages} 页` : "";
@@ -365,6 +411,26 @@ function switchView(view: ActiveView) {
   if (view === "reader") scrollReaderToTop();
 }
 
+async function onDocumentChange(event: Event) {
+  const target = event.target as HTMLSelectElement;
+  const job = activeJobs.value.find((item) => item.job_id === target.value);
+  if (job) await selectJob(job, { openReader: false });
+}
+
+function documentOptionLabel(job: WebJob) {
+  const index = queueLabel(job);
+  return `${index} · ${job.file_name} · ${jobStateLabel(job)}`;
+}
+
+function documentStateClass(job: WebJob) {
+  return {
+    done: job.state === "done",
+    failed: job.state === "failed",
+    running: job.state === "running",
+    queued: job.state === "queued"
+  };
+}
+
 function setZoom(value: number) {
   const normalized = Math.round((Number(value) || 100) / 10) * 10;
   const clamped = Math.max(minReaderZoom, Math.min(maxReaderZoom, normalized));
@@ -396,34 +462,75 @@ async function loadEngineOptions() {
 
 function onFileChange(event: Event) {
   const input = event.target as HTMLInputElement;
-  setFile(input.files?.[0] || null);
+  setFiles(input.files);
+  input.value = "";
+}
+
+function onFolderChange(event: Event) {
+  const input = event.target as HTMLInputElement;
+  setFiles(input.files);
+  input.value = "";
 }
 
 function onDrop(event: DragEvent) {
   dragging.value = false;
-  setFile(event.dataTransfer?.files?.[0] || null);
+  setFiles(event.dataTransfer?.files || null);
 }
 
-function setFile(selectedFile: File | null) {
-  if (!selectedFile) return;
+function setFiles(fileList: FileList | File[] | null) {
+  if (isBusy.value) return;
+  const incomingFiles = Array.from(fileList || []);
+  const pdfFiles = incomingFiles.filter((item) => filePath(item).toLowerCase().endsWith(".pdf"));
+  const ignoredCount = incomingFiles.length - pdfFiles.length;
+
   activeView.value = "upload";
-  file.value = selectedFile;
+  if (activeJobs.value.length) {
+    activeJobs.value = [];
+    activeJobId.value = null;
+    resetReader();
+  }
+
+  const existingKeys = new Set(selectedFiles.value.map(fileKey));
+  const additions = pdfFiles.filter((item) => !existingKeys.has(fileKey(item)));
+  selectedFiles.value = [...selectedFiles.value, ...additions];
+
   resetReader();
   readerTitle.value = "Markdown 阅读器";
   downloadUrl.value = "";
   keywordResults.value = [];
   keywordStatus.value = "OCR 完成后可以在这里提取关键词段落。";
-  logs.value = [];
-  statusText.value = "已选择文件，等待开始解析";
-  if (fileInput.value && fileInput.value.files?.[0] !== selectedFile && typeof DataTransfer !== "undefined") {
-    const dataTransfer = new DataTransfer();
-    dataTransfer.items.add(selectedFile);
-    fileInput.value.files = dataTransfer.files;
+  logs.value = ignoredCount ? [`已忽略 ${ignoredCount} 个非 PDF 文件`] : [];
+  if (additions.length) {
+    statusText.value = `已加入 ${additions.length} 个 PDF，待处理 ${selectedFiles.value.length} 个`;
+  } else if (ignoredCount) {
+    statusText.value = selectedFiles.value.length ? "没有新增 PDF 文件" : "未找到 PDF 文件";
+  } else {
+    statusText.value = "没有新增文件";
   }
 }
 
+function clearSelectedFiles() {
+  selectedFiles.value = [];
+  activeJobs.value = [];
+  activeJobId.value = null;
+  logs.value = [];
+  progress.value = 0;
+  statusText.value = "等待上传";
+  resetReader();
+}
+
+function removeSelectedFile(index: number) {
+  if (isBusy.value) return;
+  const removed = selectedFiles.value[index];
+  selectedFiles.value = selectedFiles.value.filter((_, itemIndex) => itemIndex !== index);
+  logs.value = [];
+  statusText.value = selectedFiles.value.length
+    ? `已移除 ${removed ? filePath(removed) : "文件"}，待处理 ${selectedFiles.value.length} 个`
+    : "等待上传";
+}
+
 async function startUpload() {
-  if (!file.value || isBusy.value) return;
+  if (!selectedFiles.value.length || isBusy.value) return;
   activeView.value = "upload";
   isBusy.value = true;
   progress.value = 0;
@@ -436,10 +543,12 @@ async function startUpload() {
   keywordStatus.value = "OCR 完成后可以在这里提取关键词段落。";
 
   try {
-    const job = await createJob(file.value, engine.value, (percent) => setProgress(percent, "正在上传 PDF"));
-    activeJob.value = job;
-    setProgress(job.progress || 8, job.message || "已提交 OCR 任务");
-    void pollJob(job.job_id);
+    const batch = await createJobs(selectedFiles.value, engine.value, (percent) => setProgress(percent, "正在上传 PDF"));
+    activeJobs.value = batch.jobs || [];
+    activeJobId.value = activeJobs.value[0]?.job_id || null;
+    setProgress(8, batch.count > 1 ? `已提交 ${batch.count} 个 OCR 任务` : "已提交 OCR 任务");
+    if (batch.skipped) logs.value = [`已忽略 ${batch.skipped} 个非 PDF 文件`];
+    void pollJobs();
   } catch (error) {
     failUpload(getErrorMessage(error));
   }
@@ -451,39 +560,76 @@ function failUpload(message: string) {
   isBusy.value = false;
 }
 
-async function pollJob(jobId: string) {
+async function pollJobs() {
   clearPollTimer();
+  if (!activeJobs.value.length) {
+    isBusy.value = false;
+    return;
+  }
+
   try {
-    const job = await getJob(jobId);
-    activeJob.value = job;
-    setProgress(job.progress, job.message);
-    logs.value = job.log_tail || [];
-    if (job.state === "done") {
-      if (job.markdown_url) await loadMarkdown(job.markdown_url, job.pages_url);
-      downloadUrl.value = job.download_url || "";
+    const jobs = await Promise.all(activeJobs.value.map((item) => getJob(item.job_id)));
+    activeJobs.value = jobs;
+
+    const totalProgress = jobs.reduce((sum, item) => sum + (Number(item.progress) || 0), 0) / jobs.length;
+    const finished = jobs.filter((item) => item.state === "done" || item.state === "failed").length;
+    const failed = jobs.filter((item) => item.state === "failed").length;
+    const running = jobs.find((item) => item.state === "running");
+    const queued = jobs.find((item) => item.state === "queued");
+    const selected = activeJobId.value ? jobs.find((item) => item.job_id === activeJobId.value) : null;
+    const current = running || queued || selected || jobs[0] || null;
+    if (!selected) {
+      activeJobId.value = current?.job_id || null;
+    }
+    logs.value = activeJob.value?.log_tail || [];
+    const prefix = jobs.length > 1 ? `队列 ${finished}/${jobs.length}` : "";
+    const message = current?.message || (failed ? "部分任务失败" : "处理完成");
+    setProgress(totalProgress, prefix ? `${prefix}：${message}` : message);
+
+    if (jobs.length === 1 && activeJob.value?.state === "done" && activeJob.value.markdown_url && !markdown.value) {
+      await loadJobResult(activeJob.value);
+    }
+
+    if (activeView.value !== "upload" && activeJob.value?.state === "done" && activeJob.value.markdown_url && !markdown.value) {
+      await loadJobResult(activeJob.value, { openReader: false });
+    }
+
+    if (finished === jobs.length) {
+      const selectedDone = activeJob.value?.state === "done" ? activeJob.value : null;
+      const firstDone = jobs.find((item) => item.state === "done");
+      if (!markdown.value && (selectedDone || firstDone)) await loadJobResult(selectedDone || firstDone);
       isBusy.value = false;
       return;
     }
-    if (job.state === "failed") {
-      setProgress(100, job.error || "处理失败");
-      isBusy.value = false;
-      return;
-    }
-    pollTimer = window.setTimeout(() => void pollJob(jobId), 2000);
+
+    pollTimer = window.setTimeout(() => void pollJobs(), 2000);
   } catch (error) {
-    if (error instanceof ApiError && error.status === 404) {
-      if (activeJob.value?.job_id === jobId) activeJob.value = null;
-      isBusy.value = false;
-      logs.value = [];
-      setProgress(0, "任务不存在或服务已重启，请重新上传 PDF");
-      return;
-    }
     statusText.value = `轮询失败：${getErrorMessage(error)}`;
-    pollTimer = window.setTimeout(() => void pollJob(jobId), 4000);
+    pollTimer = window.setTimeout(() => void pollJobs(), 4000);
   }
 }
 
-async function loadMarkdown(url: string, pagesUrl?: string | null) {
+async function selectJob(job: WebJob, options: { openReader?: boolean } = {}) {
+  activeJobId.value = job.job_id;
+  logs.value = job.log_tail || [];
+  keywordResults.value = [];
+  keywordStatus.value = "OCR 完成后可以在这里提取关键词段落。";
+  if (job.state === "done" && job.markdown_url) {
+    await loadJobResult(job, { openReader: options.openReader ?? true });
+    return;
+  }
+  resetReader();
+  readerTitle.value = "Markdown 阅读器";
+  downloadUrl.value = "";
+}
+
+async function loadJobResult(job: WebJob, options: { openReader?: boolean } = {}) {
+  activeJobId.value = job.job_id;
+  if (job.markdown_url) await loadMarkdown(job.markdown_url, job.pages_url, options);
+  downloadUrl.value = job.download_url || "";
+}
+
+async function loadMarkdown(url: string, pagesUrl?: string | null, options: { openReader?: boolean } = {}) {
   markdown.value = await getMarkdown(url);
   displayMarkdown.value = stripPageHeadings(markdown.value);
   originalReaderState.value = null;
@@ -494,10 +640,12 @@ async function loadMarkdown(url: string, pagesUrl?: string | null) {
   pageInput.value = 1;
   readerTitle.value = "OCR Markdown 阅读器";
   showRaw.value = false;
-  activeView.value = "reader";
+  if (options.openReader !== false) activeView.value = "reader";
   await nextTick();
   scrollReaderToTop();
-  document.querySelector(".reader")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  if (options.openReader !== false) {
+    document.querySelector(".reader")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
 }
 
 async function loadPageItems(url: string) {
@@ -541,7 +689,11 @@ function scrollReaderToTop() {
 }
 
 async function extractKeywordResults() {
-  if (!activeJob.value || !keywordInput.value.trim()) {
+  if (!activeJob.value || activeJob.value.state !== "done") {
+    keywordStatus.value = "请先选择已完成的 OCR 任务。";
+    return;
+  }
+  if (!keywordInput.value.trim()) {
     keywordStatus.value = "请先输入至少一个关键词。";
     return;
   }
@@ -641,6 +793,30 @@ function buildKeywordMarkdown(data: KeywordExtractionResponse) {
 function pageLabel(item: KeywordResult) {
   if (item.page_start === item.page_end) return `第 ${item.page_start} 页`;
   return `第 ${item.page_start}-${item.page_end} 页`;
+}
+
+function queueLabel(job: WebJob) {
+  if (!job.queue_index || !job.queue_total || job.queue_total <= 1) return "任务";
+  return `${job.queue_index}/${job.queue_total}`;
+}
+
+function jobStateLabel(job: WebJob) {
+  if (job.state === "done") return "已完成";
+  if (job.state === "failed") return job.error || "失败";
+  if (job.state === "running") return `${Math.round(job.progress || 0)}%`;
+  return "排队中";
+}
+
+function pendingFileDetail(file: File) {
+  return `${(file.size / 1024 / 1024).toFixed(2)} MB`;
+}
+
+function fileKey(file: File) {
+  return `${filePath(file)}:${file.size}:${file.lastModified}`;
+}
+
+function filePath(file: File) {
+  return (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name;
 }
 
 function setProgress(percent: number, text?: string) {

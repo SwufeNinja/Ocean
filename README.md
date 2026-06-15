@@ -53,7 +53,7 @@ cp .env.example .env
 
 ## 本地启动前后端服务
 
-开发调试时需要分别启动后端和前端：后端 FastAPI 监听 `127.0.0.1:8000`，前端 Vite 监听 `127.0.0.1:5173`，Vite 会把 `/api` 请求代理到后端。
+开发调试时需要分别启动后端和前端：后端 FastAPI 监听 `127.0.0.1:8010`，前端 Vite 监听 `127.0.0.1:5173`，Vite 会把 `/api` 请求代理到后端。
 
 以下命令以 Windows PowerShell 为例。首次启动前请先完成上面的安装和配置。
 
@@ -61,13 +61,13 @@ cp .env.example .env
 
 ```powershell
 cd C:\ocean
-.\.venv\Scripts\python.exe -m ocean.web --config .\config.yaml --output .\outputs --host 127.0.0.1 --port 8000
+.\.venv\Scripts\python.exe -m ocean.web --config .\config.yaml --output .\outputs --host 127.0.0.1 --port 8010
 ```
 
 如果已经激活虚拟环境，也可以使用命令行入口：
 
 ```powershell
-ocean web --config .\config.yaml --output .\outputs --host 127.0.0.1 --port 8000
+ocean web --config .\config.yaml --output .\outputs --host 127.0.0.1 --port 8010
 ```
 
 终端 2：启动前端开发服务：
@@ -92,13 +92,13 @@ npm install
 npm run build
 
 cd C:\ocean
-.\.venv\Scripts\python.exe -m ocean.web --config .\config.yaml --output .\outputs --host 127.0.0.1 --port 8000
+.\.venv\Scripts\python.exe -m ocean.web --config .\config.yaml --output .\outputs --host 127.0.0.1 --port 8010
 ```
 
 构建后访问：
 
 ```text
-http://127.0.0.1:8000/
+http://127.0.0.1:8010/
 ```
 
 ## 命令行用法
@@ -126,13 +126,13 @@ outputs/
 如果已经执行过 `npm run build`，也可以只启动后端，由 FastAPI 托管前端静态资源：
 
 ```bash
-ocean web --config ./config.yaml --output ./outputs --host 127.0.0.1 --port 8000
+ocean web --config ./config.yaml --output ./outputs --host 127.0.0.1 --port 8010
 ```
 
 然后打开：
 
 ```text
-http://127.0.0.1:8000/
+http://127.0.0.1:8010/
 ```
 
 页面支持上传 PDF、选择 PaddleOCR 或 MinerU、显示上传和 OCR 处理进度，并在处理完成后直接以 Markdown 阅读器方式展示结果。Web 流程目前只生成 Markdown，不额外导出 OCR JSON，也暂不支持关键词或 LLM 提取。

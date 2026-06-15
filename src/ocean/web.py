@@ -35,6 +35,7 @@ ENGINE_LABELS = {
     "paddleocr": "PaddleOCR",
     "mineru": "MinerU",
 }
+DEFAULT_ENGINE = "mineru"
 ENGINE_ALIASES = {
     "paddle": "paddleocr",
     "paddleocr": "paddleocr",
@@ -51,6 +52,9 @@ class WebJob:
     job_dir: Path
     input_path: Path
     log_path: Path
+    batch_id: str | None = None
+    queue_index: int | None = None
+    queue_total: int | None = None
     state: str = "queued"
     progress: int = 0
     message: str = "等待处理"
@@ -67,9 +71,12 @@ class WebJob:
         pages_url = f"/api/jobs/{self.job_id}/pages" if self.ocr_document else None
         return {
             "job_id": self.job_id,
+            "batch_id": self.batch_id,
             "file_name": self.file_name,
             "engine": self.engine,
             "engine_label": ENGINE_LABELS.get(self.engine, self.engine),
+            "queue_index": self.queue_index,
+            "queue_total": self.queue_total,
             "state": self.state,
             "progress": self.progress,
             "message": self.message,
@@ -113,53 +120,70 @@ def make_app(config: dict[str, Any], output_dir: str | Path = "./outputs"):
     @app.get("/api/engines")
     def list_engines() -> dict[str, Any]:
         return {
-            "default_engine": "paddleocr",
+            "default_engine": DEFAULT_ENGINE,
             "engines": [
-                {"value": "paddleocr", "label": "PaddleOCR", "description": "默认：适合快速文档 OCR"},
-                {"value": "mineru", "label": "MinerU", "description": "适合版面复杂的长文档解析"},
+                {"value": "mineru", "label": "MinerU", "description": "默认：适合版面复杂的长文档解析"},
+                {"value": "paddleocr", "label": "PaddleOCR", "description": "适合快速文档 OCR"},
             ],
         }
 
     @app.post("/api/jobs")
-    async def create_job(file: UploadFile = File(...), engine: str = Form("paddleocr")) -> dict[str, Any]:
+    async def create_job(file: UploadFile = File(...), engine: str = Form(DEFAULT_ENGINE)) -> dict[str, Any]:
         selected_engine = _normalize_engine(engine)
-        original_filename = Path(file.filename or "").name
-        if not original_filename.lower().endswith(".pdf"):
+        if not _is_pdf_upload(file):
             raise HTTPException(status_code=400, detail="只支持 PDF 文件")
-        filename = _safe_pdf_name(original_filename)
-
-        job_id = uuid.uuid4().hex[:12]
-        job_dir = web_root / job_id
-        upload_dir = upload_root / job_id
-        job_dir.mkdir(parents=True, exist_ok=True)
-        upload_dir.mkdir(parents=True, exist_ok=True)
-        input_path = upload_dir / filename
-
-        with input_path.open("wb") as f:
-            while chunk := await file.read(1024 * 1024):
-                f.write(chunk)
-
-        now = _now()
-        job = WebJob(
-            job_id=job_id,
-            file_name=filename,
-            engine=selected_engine,
-            job_dir=job_dir,
-            input_path=input_path,
-            log_path=job_dir / "ocr_run.log",
-            created_at=now,
-            updated_at=now,
-        )
+        job = await _create_web_job_from_upload(file, selected_engine, web_root, upload_root)
         with jobs_lock:
-            jobs[job_id] = job
+            jobs[job.job_id] = job
 
         thread = threading.Thread(
             target=_run_job,
-            args=(job_id, jobs, jobs_lock, ocr_lock, config),
+            args=(job.job_id, jobs, jobs_lock, ocr_lock, config),
             daemon=True,
         )
         thread.start()
         return job.to_dict()
+
+    @app.post("/api/jobs/batch")
+    async def create_batch_jobs(files: list[UploadFile] = File(...), engine: str = Form(DEFAULT_ENGINE)) -> dict[str, Any]:
+        selected_engine = _normalize_engine(engine)
+        pdf_files = [upload for upload in files if _is_pdf_upload(upload)]
+        if not pdf_files:
+            raise HTTPException(status_code=400, detail="请选择至少一个 PDF 文件")
+
+        batch_id = uuid.uuid4().hex[:12]
+        created_jobs: list[WebJob] = []
+        queue_total = len(pdf_files)
+        for index, upload in enumerate(pdf_files, start=1):
+            created_jobs.append(
+                await _create_web_job_from_upload(
+                    upload,
+                    selected_engine,
+                    web_root,
+                    upload_root,
+                    batch_id=batch_id,
+                    queue_index=index,
+                    queue_total=queue_total,
+                )
+            )
+
+        with jobs_lock:
+            for job in created_jobs:
+                jobs[job.job_id] = job
+
+        thread = threading.Thread(
+            target=_run_batch_jobs,
+            args=([job.job_id for job in created_jobs], jobs, jobs_lock, ocr_lock, config),
+            daemon=True,
+        )
+        thread.start()
+
+        return {
+            "batch_id": batch_id,
+            "count": len(created_jobs),
+            "skipped": len(files) - len(pdf_files),
+            "jobs": [job.to_dict() for job in created_jobs],
+        }
 
     @app.get("/api/jobs/{job_id}")
     def get_job(job_id: str) -> dict[str, Any]:
@@ -255,7 +279,51 @@ def make_app(config: dict[str, Any], output_dir: str | Path = "./outputs"):
     return app
 
 
-def serve(config: dict[str, Any], output_dir: str | Path, host: str = "127.0.0.1", port: int = 8000) -> None:
+async def _create_web_job_from_upload(
+    file: UploadFile,
+    selected_engine: str,
+    web_root: Path,
+    upload_root: Path,
+    *,
+    batch_id: str | None = None,
+    queue_index: int | None = None,
+    queue_total: int | None = None,
+) -> WebJob:
+    original_filename = Path(file.filename or "").name
+    filename = _safe_pdf_name(original_filename)
+
+    job_id = uuid.uuid4().hex[:12]
+    job_dir = web_root / job_id
+    upload_dir = upload_root / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    input_path = upload_dir / filename
+
+    with input_path.open("wb") as f:
+        while chunk := await file.read(1024 * 1024):
+            f.write(chunk)
+
+    now = _now()
+    return WebJob(
+        job_id=job_id,
+        batch_id=batch_id,
+        queue_index=queue_index,
+        queue_total=queue_total,
+        file_name=filename,
+        engine=selected_engine,
+        job_dir=job_dir,
+        input_path=input_path,
+        log_path=job_dir / "ocr_run.log",
+        created_at=now,
+        updated_at=now,
+    )
+
+
+def _is_pdf_upload(file: UploadFile) -> bool:
+    return str(file.filename or "").lower().endswith(".pdf")
+
+
+def serve(config: dict[str, Any], output_dir: str | Path, host: str = "127.0.0.1", port: int = 8010) -> None:
     try:
         import uvicorn
     except ImportError as exc:  # pragma: no cover
@@ -272,7 +340,7 @@ def main() -> None:
     parser.add_argument("--config", required=True, help="YAML config path.")
     parser.add_argument("--output", default="./outputs", help="Output directory.")
     parser.add_argument("--host", default="127.0.0.1", help="Web server host.")
-    parser.add_argument("--port", type=int, default=8000, help="Web server port.")
+    parser.add_argument("--port", type=int, default=8010, help="Web server port.")
     args = parser.parse_args()
 
     serve(config=load_config(args.config), output_dir=args.output, host=args.host, port=args.port)
@@ -298,6 +366,38 @@ def _run_job(
             _update_job(jobs, jobs_lock, job_id, state="failed", progress=100, message="处理失败", error=str(exc))
         finally:
             set_log_file(None)
+
+
+def _run_batch_jobs(
+    job_ids: list[str],
+    jobs: dict[str, WebJob],
+    jobs_lock: threading.Lock,
+    ocr_lock: threading.Lock,
+    config: dict[str, Any],
+) -> None:
+    for job_id in job_ids:
+        _update_job(jobs, jobs_lock, job_id, state="queued", progress=1, message="排队等待 OCR 任务")
+
+    with ocr_lock:
+        for job_id in job_ids:
+            job = _get_job(job_id, jobs, jobs_lock)
+            if not job:
+                continue
+            set_log_file(job.log_path)
+            try:
+                if job.queue_index and job.queue_total:
+                    _update_job(
+                        jobs,
+                        jobs_lock,
+                        job_id,
+                        message=f"队列第 {job.queue_index}/{job.queue_total} 个任务开始处理",
+                    )
+                _recognize_job(job_id, jobs, jobs_lock, config)
+            except Exception as exc:  # pragma: no cover - depends on external OCR service
+                log(f"Web OCR failed: {exc}")
+                _update_job(jobs, jobs_lock, job_id, state="failed", progress=100, message="处理失败", error=str(exc))
+            finally:
+                set_log_file(None)
 
 
 def _recognize_job(
@@ -370,7 +470,7 @@ def _recognize_job(
 def _web_ocr_config(config: dict[str, Any], engine: str) -> dict[str, Any]:
     ocr_config = copy.deepcopy(config.get("ocr", {}))
     engine_configs = copy.deepcopy(config.get("ocr_engines", {}))
-    current_engine = _normalize_engine(ocr_config.get("engine", "paddleocr"))
+    current_engine = _normalize_engine(ocr_config.get("engine", DEFAULT_ENGINE))
 
     if engine in engine_configs and isinstance(engine_configs[engine], dict):
         merged = copy.deepcopy(ocr_config)
@@ -420,7 +520,7 @@ def _web_ocr_config(config: dict[str, Any], engine: str) -> dict[str, Any]:
 
 
 def _normalize_engine(engine: Any) -> str:
-    normalized = ENGINE_ALIASES.get(str(engine or "paddleocr").strip().lower())
+    normalized = ENGINE_ALIASES.get(str(engine or DEFAULT_ENGINE).strip().lower())
     if not normalized:
         raise HTTPException(status_code=400, detail=f"不支持的 OCR 引擎：{engine}")
     return normalized

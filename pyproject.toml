@@ -16,6 +16,11 @@ dependencies = [
   "uvicorn[standard]>=0.30"
 ]
 
+[project.optional-dependencies]
+dev = [
+  "pytest>=9.1"
+]
+
 [project.scripts]
 ocean = "ocean.cli:main"
 ocean-web = "ocean.web:main"

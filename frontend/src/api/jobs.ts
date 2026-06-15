@@ -13,9 +13,12 @@ export type JobState = "queued" | "running" | "done" | "failed" | string;
 
 export interface WebJob {
   job_id: string;
+  batch_id?: string | null;
   file_name: string;
   engine: string;
   engine_label?: string;
+  queue_index?: number | null;
+  queue_total?: number | null;
   state: JobState;
   progress: number;
   message: string;
@@ -27,6 +30,13 @@ export interface WebJob {
   created_at?: string;
   updated_at?: string;
   log_tail?: string[];
+}
+
+export interface BatchJobsResponse {
+  batch_id: string;
+  count: number;
+  skipped: number;
+  jobs: WebJob[];
 }
 
 export interface OcrPage {
@@ -122,6 +132,41 @@ export function createJob(
   });
 }
 
+export function createJobs(
+  files: File[],
+  engine: string,
+  onUploadProgress?: (percent: number) => void
+): Promise<BatchJobsResponse> {
+  const formData = new FormData();
+  for (const file of files) {
+    formData.append("files", file, filePath(file));
+  }
+  formData.append("engine", engine);
+
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", "/api/jobs/batch");
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable) {
+        onUploadProgress?.(Math.round((event.loaded / event.total) * 8));
+      }
+    };
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          resolve(JSON.parse(xhr.responseText) as BatchJobsResponse);
+        } catch (error) {
+          reject(error);
+        }
+        return;
+      }
+      reject(new Error(readErrorMessage(xhr.responseText) || "上传失败"));
+    };
+    xhr.onerror = () => reject(new Error("网络错误"));
+    xhr.send(formData);
+  });
+}
+
 export async function getJob(jobId: string): Promise<WebJob> {
   return fetchJson<WebJob>(`/api/jobs/${encodeURIComponent(jobId)}`);
 }
@@ -188,4 +233,8 @@ function readErrorPayload(payload: unknown): string {
   const detail = (payload as { detail?: unknown }).detail;
   if (typeof detail === "string") return detail;
   return "";
+}
+
+function filePath(file: File): string {
+  return (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name;
 }

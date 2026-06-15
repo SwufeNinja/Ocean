@@ -20,7 +20,7 @@ def main() -> None:
     web_parser.add_argument("--config", required=True, help="YAML config path.")
     web_parser.add_argument("--output", default="./outputs", help="Output directory.")
     web_parser.add_argument("--host", default="127.0.0.1", help="Web server host.")
-    web_parser.add_argument("--port", type=int, default=8000, help="Web server port.")
+    web_parser.add_argument("--port", type=int, default=8010, help="Web server port.")
 
     keyword_parser = subparsers.add_parser("extract-keywords", help="Extract keyword-matched paragraphs.")
     keyword_parser.add_argument("--ocr-dir", required=True, help="Directory containing OCR JSON files.")
