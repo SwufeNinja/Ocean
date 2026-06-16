@@ -13,6 +13,12 @@ export type JobState = "queued" | "running" | "done" | "failed" | string;
 
 export interface WebJob {
   job_id: string;
+  account_id?: string;
+  knowledge_base_id?: string;
+  document_id?: string | null;
+  file_sha256?: string | null;
+  processing_fingerprint?: string | null;
+  reused?: boolean;
   batch_id?: string | null;
   file_name: string;
   engine: string;
@@ -37,6 +43,32 @@ export interface BatchJobsResponse {
   count: number;
   skipped: number;
   jobs: WebJob[];
+}
+
+export interface KnowledgeDocument {
+  account_id: string;
+  knowledge_base_id: string;
+  document_id: string;
+  file_name: string;
+  file_ext?: string;
+  file_size?: number | null;
+  file_sha256?: string | null;
+  status: string;
+  ocr_engine?: string;
+  page_count?: number | null;
+  processed_at?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  markdown_url?: string | null;
+  download_url?: string | null;
+  pages_url?: string | null;
+}
+
+export interface KnowledgeDocumentsResponse {
+  account_id: string;
+  knowledge_base_id: string;
+  count: number;
+  documents: KnowledgeDocument[];
 }
 
 export interface OcrPage {
@@ -85,6 +117,49 @@ export interface KeywordExtractionResponse {
   results: KeywordResult[];
 }
 
+export interface LlmStatusResponse {
+  provider: string;
+  configured: boolean;
+  model: string;
+  temperature: number;
+  max_tokens: number;
+}
+
+export type LlmMessageRole = "system" | "user" | "assistant";
+
+export interface LlmMessage {
+  message_id: string;
+  role: LlmMessageRole;
+  content: string;
+  created_at: string;
+}
+
+export interface LlmConversation {
+  conversation_id: string;
+  account_id: string;
+  knowledge_base_id: string;
+  title: string;
+  system_prompt: string;
+  message_count: number;
+  messages?: LlmMessage[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreateLlmConversationOptions {
+  accountId?: string;
+  knowledgeBaseId?: string;
+  title?: string;
+  systemPrompt?: string;
+  messages?: Array<{ role: LlmMessageRole; content: string }>;
+}
+
+export interface SendLlmMessageResponse {
+  conversation: LlmConversation;
+  user_message: LlmMessage;
+  assistant_message: LlmMessage;
+}
+
 export class ApiError extends Error {
   status: number;
 
@@ -97,6 +172,21 @@ export class ApiError extends Error {
 
 export async function listEngines(): Promise<EnginesResponse> {
   return fetchJson<EnginesResponse>("/api/engines");
+}
+
+export async function listKnowledgeDocuments(options: {
+  accountId: string;
+  knowledgeBaseId: string;
+  query?: string;
+  limit?: number;
+}): Promise<KnowledgeDocumentsResponse> {
+  const params = new URLSearchParams({
+    account_id: options.accountId,
+    knowledge_base_id: options.knowledgeBaseId,
+    limit: String(options.limit || 100)
+  });
+  if (options.query?.trim()) params.set("q", options.query.trim());
+  return fetchJson<KnowledgeDocumentsResponse>(`/api/documents?${params.toString()}`);
 }
 
 export function createJob(
@@ -201,6 +291,57 @@ export async function extractKeywords(
   return fetchJson<KeywordExtractionResponse>(`/api/jobs/${encodeURIComponent(jobId)}/extract-keywords`, {
     method: "POST",
     body: formData
+  });
+}
+
+export async function extractDocumentKeywords(
+  documentId: string,
+  accountId: string,
+  knowledgeBaseId: string,
+  options: ExtractKeywordOptions
+): Promise<KeywordExtractionResponse> {
+  const formData = new FormData();
+  formData.append("account_id", accountId);
+  formData.append("knowledge_base_id", knowledgeBaseId);
+  formData.append("keywords", options.keywords);
+  formData.append("match_mode", options.matchMode);
+  formData.append("context_before", String(options.contextBefore || 0));
+  formData.append("context_after", String(options.contextAfter || 0));
+  formData.append("granularity", options.granularity);
+  formData.append("use_regex", String(options.useRegex));
+  formData.append("case_sensitive", String(options.caseSensitive));
+  formData.append("normalize_chinese", String(options.normalizeChinese));
+  formData.append("deduplicate", String(options.deduplicate));
+
+  return fetchJson<KeywordExtractionResponse>(`/api/documents/${encodeURIComponent(documentId)}/extract-keywords`, {
+    method: "POST",
+    body: formData
+  });
+}
+
+export async function getLlmStatus(): Promise<LlmStatusResponse> {
+  return fetchJson<LlmStatusResponse>("/api/llm/status");
+}
+
+export async function createLlmConversation(options: CreateLlmConversationOptions = {}): Promise<LlmConversation> {
+  return fetchJson<LlmConversation>("/api/llm/conversations", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      account_id: options.accountId,
+      knowledge_base_id: options.knowledgeBaseId,
+      title: options.title,
+      system_prompt: options.systemPrompt,
+      messages: options.messages
+    })
+  });
+}
+
+export async function sendLlmMessage(conversationId: string, content: string): Promise<SendLlmMessageResponse> {
+  return fetchJson<SendLlmMessageResponse>(`/api/llm/conversations/${encodeURIComponent(conversationId)}/messages`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ content })
   });
 }
 

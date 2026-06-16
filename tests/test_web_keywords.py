@@ -14,6 +14,10 @@ class WebKeywordExtractionTest(unittest.TestCase):
 
         self.assertIn("/api/jobs/{job_id}/extract-keywords", routes)
         self.assertIn("/api/jobs/batch", routes)
+        self.assertIn("/api/documents", routes)
+        self.assertIn("/api/documents/{document_id}/markdown", routes)
+        self.assertIn("/api/documents/{document_id}/pages", routes)
+        self.assertIn("/api/documents/{document_id}/extract-keywords", routes)
 
     def test_keyword_panel_is_present_in_vue_app(self) -> None:
         app_vue = Path("frontend/src/App.vue").read_text(encoding="utf-8")
@@ -29,6 +33,9 @@ class WebKeywordExtractionTest(unittest.TestCase):
         self.assertNotIn("Keyword Extractor", app_vue)
         self.assertNotIn("keywordInput: '\u9752\u5e74", app_vue)
         self.assertIn("extractKeywords", app_vue)
+        self.assertIn("listKnowledgeDocuments", app_vue)
+        self.assertIn("openLibraryDocument", app_vue)
+        self.assertIn("\u77e5\u8bc6\u5e93", app_vue)
         self.assertIn("createJobs", app_vue)
         self.assertIn("folderInput", app_vue)
         self.assertIn("pageItems.value = buildKeywordPageItems(data)", app_vue)

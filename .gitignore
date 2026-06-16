@@ -16,6 +16,7 @@ config.yaml
 outputs/
 outputs_*/
 pdfs/
+tmp/
 
 # Frontend
 frontend/node_modules/

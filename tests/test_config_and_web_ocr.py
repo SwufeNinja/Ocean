@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import tempfile
 import unittest
@@ -92,6 +93,9 @@ class ConfigAndWebOcrTest(unittest.TestCase):
             self.assertEqual(job.queue_total, 3)
             self.assertTrue(job.input_path.name.endswith(".pdf"))
             self.assertEqual(job.input_path.read_bytes(), b"%PDF-1.4 test")
+            self.assertEqual(job.file_sha256, hashlib.sha256(b"%PDF-1.4 test").hexdigest())
+            self.assertEqual(job.account_id, "local")
+            self.assertEqual(job.knowledge_base_id, "default")
         self.assertTrue(_is_pdf_upload(FakeUpload("x.PDF", b"")))  # type: ignore[arg-type]
         self.assertFalse(_is_pdf_upload(FakeUpload("x.txt", b"")))  # type: ignore[arg-type]
 

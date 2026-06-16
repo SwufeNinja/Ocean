@@ -60,3 +60,15 @@ llm:
   max_tokens: 4096
   timeout_seconds: 120
   retry: 3
+
+elasticsearch:
+  enabled: false
+  hosts:
+    - http://127.0.0.1:9200
+  username: ""
+  password: ""
+  index_prefix: ocean
+  analyzer: ik_max_word
+  search_analyzer: ik_smart
+  request_timeout_seconds: 30
+  verify_certs: true
