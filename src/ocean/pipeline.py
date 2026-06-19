@@ -256,11 +256,17 @@ def run_semantic_extraction(ocr_dir: str | Path, output_dir: str | Path, config:
     topics = extraction_config.get("semantic_topics", [])
 
     results: list[ExtractionResult] = []
+    failures: list[dict[str, Any]] = []
     for document in documents:
         chunks = chunk_by_pages(document, pages_per_chunk=chunk_pages)
-        results.extend(extract_semantic(chunks, topics, llm_client))
+        results.extend(extract_semantic(chunks, topics, llm_client, failure_callback=failures.append))
     _renumber_results(results, "S")
-    return _write_extraction_outputs(results, output_dir, "semantic")
+    written_results = _write_extraction_outputs(results, output_dir, "semantic")
+    if failures:
+        failure_path = Path(output_dir) / "extract" / "semantic_failures.json"
+        failure_path.parent.mkdir(parents=True, exist_ok=True)
+        failure_path.write_text(json.dumps(failures, ensure_ascii=False, indent=2), encoding="utf-8")
+    return written_results
 
 
 def load_ocr_documents(ocr_dir: str | Path) -> list[OcrDocument]:

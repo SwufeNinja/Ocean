@@ -52,7 +52,7 @@ LLM 默认支持 OpenAI-compatible Chat Completions API。
 ## 3. 项目结构
 
 ```text
-Ocean/
+OCR Assistant/
   README.md
   pyproject.toml
   config.example.yaml

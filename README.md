@@ -1,6 +1,6 @@
-# Ocean
+# OCR Assistant
 
-Ocean 是一个面向学术材料整理的 PDF OCR 与文本提取工具。项目目标是批量处理 PDF，保留 OCR 文本与原 PDF 页码的对应关系，并基于关键词或 LLM 语义理解提取指定主题相关内容。
+OCR Assistant 是一个面向学术材料整理的 PDF OCR 与文本提取工具。项目目标是批量处理 PDF，保留 OCR 文本与原 PDF 页码的对应关系，并基于关键词或 LLM 语义理解提取指定主题相关内容。
 
 ## 当前状态
 

@@ -5,6 +5,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from ocean.extractors import chunk_by_pages
 from ocean.models import OcrBlock, OcrDocument, OcrPage
@@ -12,6 +13,7 @@ from ocean.models import OcrBlock, OcrDocument, OcrPage
 PIPELINE_VERSION = "ocean-ocr-cache-v1"
 DEFAULT_ACCOUNT_ID = "local"
 DEFAULT_KNOWLEDGE_BASE_ID = "default"
+PUBLIC_ACCOUNT_ID = "__public__"
 
 
 def create_document_store(config: dict[str, Any] | None) -> ElasticsearchDocumentStore | None:
@@ -80,11 +82,21 @@ class ElasticsearchDocumentStore:
     def jobs_index(self) -> str:
         return f"{self.index_prefix}_jobs_v1"
 
+    @property
+    def llm_conversations_index(self) -> str:
+        return f"{self.index_prefix}_llm_conversations_v1"
+
+    @property
+    def llm_messages_index(self) -> str:
+        return f"{self.index_prefix}_llm_messages_v1"
+
     def ensure_indices(self) -> None:
         self._ensure_index(self.documents_index, self._document_mapping())
         self._ensure_index(self.pages_index, self._page_mapping())
         self._ensure_index(self.chunks_index, self._chunk_mapping())
         self._ensure_index(self.jobs_index, self._job_mapping())
+        self._ensure_index(self.llm_conversations_index, self._llm_conversation_mapping())
+        self._ensure_index(self.llm_messages_index, self._llm_message_mapping())
 
     def find_processed_document(
         self,
@@ -126,7 +138,7 @@ class ElasticsearchDocumentStore:
             query={
                 "bool": {
                     "filter": [
-                        {"term": {"account_id": account_id}},
+                        {"terms": {"account_id": _visible_account_ids(account_id)}},
                         {"term": {"knowledge_base_id": knowledge_base_id}},
                         {"term": {"document_id": document_id}},
                         {"bool": {"must_not": [{"term": {"status": "deleted"}}]}},
@@ -146,7 +158,7 @@ class ElasticsearchDocumentStore:
         limit: int = 100,
     ) -> list[dict[str, Any]]:
         filters: list[dict[str, Any]] = [
-            {"term": {"account_id": account_id}},
+            {"terms": {"account_id": _visible_account_ids(account_id)}},
             {"term": {"knowledge_base_id": knowledge_base_id}},
             {"term": {"status": "done"}},
         ]
@@ -180,6 +192,273 @@ class ElasticsearchDocumentStore:
 
     def save_job(self, job: dict[str, Any]) -> None:
         self.client.index(index=self.jobs_index, id=job["job_id"], document=job)
+
+    def get_job(
+        self,
+        *,
+        account_id: str,
+        knowledge_base_id: str,
+        job_id: str,
+    ) -> dict[str, Any] | None:
+        response = self.client.search(
+            index=self.jobs_index,
+            size=1,
+            query={
+                "bool": {
+                    "filter": [
+                        {"term": {"account_id": account_id}},
+                        {"term": {"knowledge_base_id": knowledge_base_id}},
+                        {"term": {"job_id": job_id}},
+                    ]
+                }
+            },
+        )
+        hits = response.get("hits", {}).get("hits", [])
+        return hits[0].get("_source") if hits else None
+
+    def list_jobs(
+        self,
+        *,
+        account_id: str,
+        knowledge_base_id: str,
+        states: list[str] | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        filters: list[dict[str, Any]] = [
+            {"term": {"account_id": account_id}},
+            {"term": {"knowledge_base_id": knowledge_base_id}},
+        ]
+        normalized_states = [state for state in (states or []) if state]
+        if normalized_states:
+            filters.append({"terms": {"state": normalized_states}})
+        response = self.client.search(
+            index=self.jobs_index,
+            body={
+                "size": max(1, min(int(limit), 500)),
+                "sort": [{"updated_at": {"order": "desc", "missing": "_last"}}],
+                "query": {"bool": {"filter": filters}},
+            },
+        )
+        return [hit.get("_source", {}) for hit in response.get("hits", {}).get("hits", [])]
+
+    def save_llm_conversation(self, conversation: dict[str, Any]) -> dict[str, Any]:
+        now = _now()
+        record = dict(conversation or {})
+        conversation_id = _non_empty_str(record.get("conversation_id")) or str(uuid4())
+        context_document_ids = _llm_context_document_ids(record)
+        context_documents = record.get("context_documents")
+        record.update(
+            {
+                "conversation_id": conversation_id,
+                "account_id": _non_empty_str(record.get("account_id")) or DEFAULT_ACCOUNT_ID,
+                "knowledge_base_id": _non_empty_str(record.get("knowledge_base_id"))
+                or DEFAULT_KNOWLEDGE_BASE_ID,
+                "context_mode": _non_empty_str(record.get("context_mode"))
+                or ("documents" if context_document_ids else "none"),
+                "context_document_ids": context_document_ids,
+                "context_documents": context_documents if isinstance(context_documents, list) else [],
+                "message_count": _int_or_default(record.get("message_count"), 0),
+                "status": _non_empty_str(record.get("status")) or "active",
+                "created_at": _non_empty_str(record.get("created_at")) or now,
+                "updated_at": _non_empty_str(record.get("updated_at")) or now,
+            }
+        )
+        record.setdefault("title", "")
+        record.setdefault("deleted_at", None)
+        self.client.index(
+            index=self.llm_conversations_index,
+            id=conversation_id,
+            document=record,
+        )
+        return record
+
+    def list_llm_conversations(self, filters: dict[str, Any]) -> list[dict[str, Any]]:
+        filters = filters or {}
+        query_filters: list[dict[str, Any]] = [
+            {"term": {"account_id": _non_empty_str(filters.get("account_id")) or DEFAULT_ACCOUNT_ID}},
+            {
+                "term": {
+                    "knowledge_base_id": _non_empty_str(filters.get("knowledge_base_id"))
+                    or DEFAULT_KNOWLEDGE_BASE_ID
+                }
+            },
+        ]
+        document_id = _non_empty_str(filters.get("document_id"))
+        if document_id:
+            query_filters.append({"term": {"context_document_ids": document_id}})
+        context_mode = _non_empty_str(filters.get("context_mode"))
+        if context_mode:
+            query_filters.append({"term": {"context_mode": context_mode}})
+
+        bool_query: dict[str, Any] = {"filter": query_filters}
+        status = _non_empty_str(filters.get("status"))
+        if status:
+            query_filters.append({"term": {"status": status}})
+        elif not _as_bool(filters.get("include_deleted", False)):
+            bool_query["must_not"] = [{"term": {"status": "deleted"}}]
+
+        response = self.client.search(
+            index=self.llm_conversations_index,
+            body={
+                "size": _bounded_int(filters.get("limit"), default=100, minimum=1, maximum=500),
+                "sort": [{"updated_at": {"order": "desc", "missing": "_last"}}],
+                "query": {"bool": bool_query},
+            },
+        )
+        return [hit.get("_source", {}) for hit in response.get("hits", {}).get("hits", [])]
+
+    def get_llm_conversation(self, query: dict[str, Any]) -> dict[str, Any] | None:
+        query = query or {}
+        conversation_id = _non_empty_str(query.get("conversation_id"))
+        if not conversation_id:
+            return None
+        source = self._get_source_by_id(self.llm_conversations_index, conversation_id)
+        if source is None:
+            return None
+        if not _llm_source_matches_scope(source, query):
+            return None
+        if source.get("status") == "deleted" and not _as_bool(query.get("include_deleted", False)):
+            return None
+
+        result = dict(source)
+        if _as_bool(query.get("include_messages", False)):
+            result["messages"] = self.list_llm_messages(
+                {
+                    "conversation_id": conversation_id,
+                    "account_id": source.get("account_id"),
+                    "knowledge_base_id": source.get("knowledge_base_id"),
+                    "limit": query.get("messages_limit", query.get("limit", 1000)),
+                }
+            )
+        return result
+
+    def append_llm_messages(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        payload = payload or {}
+        conversation_id = _non_empty_str(payload.get("conversation_id"))
+        if not conversation_id:
+            raise ValueError("conversation_id is required")
+
+        conversation = self.get_llm_conversation(
+            {
+                "conversation_id": conversation_id,
+                "account_id": payload.get("account_id"),
+                "knowledge_base_id": payload.get("knowledge_base_id"),
+            }
+        )
+        if conversation is None:
+            raise ValueError("LLM conversation does not exist")
+
+        raw_messages = payload.get("messages") or []
+        if isinstance(raw_messages, dict):
+            raw_messages = [raw_messages]
+        if not isinstance(raw_messages, list):
+            raise ValueError("messages must be a list")
+
+        now = _non_empty_str(payload.get("created_at")) or _non_empty_str(payload.get("updated_at")) or _now()
+        account_id = _non_empty_str(payload.get("account_id")) or _non_empty_str(conversation.get("account_id"))
+        knowledge_base_id = _non_empty_str(payload.get("knowledge_base_id")) or _non_empty_str(
+            conversation.get("knowledge_base_id")
+        )
+        next_sequence = _append_start_sequence(payload, conversation)
+        records: list[dict[str, Any]] = []
+        for message in raw_messages:
+            if not isinstance(message, dict):
+                raise ValueError("messages must contain objects")
+            record = dict(message)
+            sequence = record.get("sequence")
+            if sequence is None or sequence == "":
+                next_sequence += 1
+                sequence = next_sequence
+            else:
+                sequence = int(sequence)
+                next_sequence = max(next_sequence, sequence)
+            message_id = _non_empty_str(record.get("message_id")) or str(uuid4())
+            record.update(
+                {
+                    "message_id": message_id,
+                    "conversation_id": conversation_id,
+                    "account_id": account_id or DEFAULT_ACCOUNT_ID,
+                    "knowledge_base_id": knowledge_base_id or DEFAULT_KNOWLEDGE_BASE_ID,
+                    "sequence": sequence,
+                    "created_at": _non_empty_str(record.get("created_at")) or now,
+                }
+            )
+            record.setdefault("metadata", {})
+            records.append(record)
+
+        for record in records:
+            self.client.index(
+                index=self.llm_messages_index,
+                id=record["message_id"],
+                document=record,
+            )
+
+        if records:
+            current_count = _int_or_default(conversation.get("message_count"), 0)
+            conversation_updates = payload.get("conversation_updates")
+            update_doc = dict(conversation_updates) if isinstance(conversation_updates, dict) else {}
+            update_doc.update(
+                {
+                    "message_count": _int_or_default(
+                        payload.get("message_count"),
+                        current_count + len(records),
+                    ),
+                    "updated_at": _non_empty_str(payload.get("updated_at")) or now,
+                }
+            )
+            self.client.update(
+                index=self.llm_conversations_index,
+                id=conversation_id,
+                doc=update_doc,
+            )
+
+        return sorted(records, key=lambda record: int(record.get("sequence") or 0))
+
+    def list_llm_messages(self, query: dict[str, Any]) -> list[dict[str, Any]]:
+        query = query or {}
+        conversation_id = _non_empty_str(query.get("conversation_id"))
+        if not conversation_id:
+            return []
+        query_filters: list[dict[str, Any]] = [{"term": {"conversation_id": conversation_id}}]
+        account_id = _non_empty_str(query.get("account_id"))
+        if account_id:
+            query_filters.append({"term": {"account_id": account_id}})
+        knowledge_base_id = _non_empty_str(query.get("knowledge_base_id"))
+        if knowledge_base_id:
+            query_filters.append({"term": {"knowledge_base_id": knowledge_base_id}})
+
+        response = self.client.search(
+            index=self.llm_messages_index,
+            body={
+                "size": _bounded_int(query.get("limit"), default=1000, minimum=1, maximum=5000),
+                "sort": [
+                    {"sequence": {"order": "asc", "missing": "_last"}},
+                    {"created_at": {"order": "asc", "missing": "_last"}},
+                ],
+                "query": {"bool": {"filter": query_filters}},
+            },
+        )
+        return [hit.get("_source", {}) for hit in response.get("hits", {}).get("hits", [])]
+
+    def soft_delete_llm_conversation(self, query: dict[str, Any]) -> dict[str, Any] | None:
+        query = query or {}
+        conversation = self.get_llm_conversation(query)
+        if conversation is None:
+            return None
+        now = _non_empty_str(query.get("deleted_at")) or _now()
+        updates = {
+            "status": "deleted",
+            "deleted_at": now,
+            "updated_at": _non_empty_str(query.get("updated_at")) or now,
+        }
+        self.client.update(
+            index=self.llm_conversations_index,
+            id=conversation["conversation_id"],
+            doc=updates,
+        )
+        result = dict(conversation)
+        result.update(updates)
+        return result
 
     def save_ocr_result(
         self,
@@ -261,7 +540,7 @@ class ElasticsearchDocumentStore:
             query={
                 "bool": {
                     "filter": [
-                        {"term": {"account_id": account_id}},
+                        {"terms": {"account_id": _visible_account_ids(account_id)}},
                         {"term": {"knowledge_base_id": knowledge_base_id}},
                         {"term": {"document_id": document_id}},
                     ]
@@ -332,6 +611,18 @@ class ElasticsearchDocumentStore:
         from elasticsearch import helpers
 
         helpers.bulk(self.client, actions)
+
+    def _get_source_by_id(self, index_name: str, document_id: str) -> dict[str, Any] | None:
+        try:
+            response = self.client.get(index=index_name, id=document_id)
+        except Exception as exc:
+            if _is_not_found_error(exc):
+                return None
+            raise
+        if response.get("found") is False:
+            return None
+        source = response.get("_source")
+        return source if isinstance(source, dict) else None
 
     def _page_actions(
         self,
@@ -489,6 +780,7 @@ class ElasticsearchDocumentStore:
                     "knowledge_base_id": {"type": "keyword"},
                     "job_id": {"type": "keyword"},
                     "document_id": {"type": "keyword"},
+                    "batch_id": {"type": "keyword"},
                     "file_name": _text_keyword(self.analyzer, self.search_analyzer),
                     "type": {"type": "keyword"},
                     "state": {"type": "keyword"},
@@ -497,9 +789,56 @@ class ElasticsearchDocumentStore:
                     "error": {"type": "text"},
                     "engine": {"type": "keyword"},
                     "reused": {"type": "boolean"},
+                    "queue_index": {"type": "integer"},
+                    "queue_total": {"type": "integer"},
+                    "total_pages": {"type": "integer"},
                     "created_at": {"type": "date"},
                     "updated_at": {"type": "date"},
                     "finished_at": {"type": "date"},
+                }
+            }
+        }
+
+    def _llm_conversation_mapping(self) -> dict[str, Any]:
+        return {
+            "mappings": {
+                "properties": {
+                    "conversation_id": {"type": "keyword"},
+                    "account_id": {"type": "keyword"},
+                    "knowledge_base_id": {"type": "keyword"},
+                    "title": _text_keyword(self.analyzer, self.search_analyzer),
+                    "origin": {"type": "keyword"},
+                    "context_mode": {"type": "keyword"},
+                    "context_document_ids": {"type": "keyword"},
+                    "context_documents": {"type": "object", "enabled": False},
+                    "system_prompt": {"type": "text", "analyzer": self.analyzer, "search_analyzer": self.search_analyzer},
+                    "provider": {"type": "keyword"},
+                    "model": {"type": "keyword"},
+                    "temperature": {"type": "float"},
+                    "max_tokens": {"type": "integer"},
+                    "message_count": {"type": "integer"},
+                    "status": {"type": "keyword"},
+                    "metadata": {"type": "object", "enabled": False},
+                    "created_at": {"type": "date"},
+                    "updated_at": {"type": "date"},
+                    "deleted_at": {"type": "date"},
+                }
+            }
+        }
+
+    def _llm_message_mapping(self) -> dict[str, Any]:
+        return {
+            "mappings": {
+                "properties": {
+                    "message_id": {"type": "keyword"},
+                    "conversation_id": {"type": "keyword"},
+                    "account_id": {"type": "keyword"},
+                    "knowledge_base_id": {"type": "keyword"},
+                    "role": {"type": "keyword"},
+                    "content": {"type": "text", "analyzer": self.analyzer, "search_analyzer": self.search_analyzer},
+                    "sequence": {"type": "integer"},
+                    "created_at": {"type": "date"},
+                    "metadata": {"type": "object", "enabled": False},
                 }
             }
         }
@@ -541,3 +880,71 @@ def _as_bool(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
     return bool(value)
+
+
+def _non_empty_str(value: Any) -> str:
+    return str(value).strip() if value is not None else ""
+
+
+def _int_or_default(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _bounded_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
+    return max(minimum, min(_int_or_default(value, default), maximum))
+
+
+def _append_start_sequence(payload: dict[str, Any], conversation: dict[str, Any]) -> int:
+    start_sequence = payload.get("start_sequence")
+    if start_sequence is not None and start_sequence != "":
+        return max(0, int(start_sequence) - 1)
+    return max(0, _int_or_default(conversation.get("message_count"), 0))
+
+
+def _llm_context_document_ids(record: dict[str, Any]) -> list[str]:
+    document_ids: list[str] = []
+    _append_unique_strings(document_ids, record.get("context_document_ids"))
+    context_documents = record.get("context_documents")
+    if isinstance(context_documents, list):
+        for context_document in context_documents:
+            if isinstance(context_document, dict):
+                _append_unique_strings(document_ids, [context_document.get("document_id")])
+    return document_ids
+
+
+def _append_unique_strings(target: list[str], values: Any) -> None:
+    if not isinstance(values, list):
+        return
+    for value in values:
+        text = _non_empty_str(value)
+        if text and text not in target:
+            target.append(text)
+
+
+def _llm_source_matches_scope(source: dict[str, Any], query: dict[str, Any]) -> bool:
+    account_id = _non_empty_str(query.get("account_id"))
+    if account_id and source.get("account_id") != account_id:
+        return False
+    knowledge_base_id = _non_empty_str(query.get("knowledge_base_id"))
+    if knowledge_base_id and source.get("knowledge_base_id") != knowledge_base_id:
+        return False
+    return True
+
+
+def _is_not_found_error(exc: Exception) -> bool:
+    if getattr(exc, "status_code", None) == 404:
+        return True
+    meta = getattr(exc, "meta", None)
+    if getattr(meta, "status", None) == 404:
+        return True
+    return exc.__class__.__name__ == "NotFoundError"
+
+
+def _visible_account_ids(account_id: str) -> list[str]:
+    account = str(account_id or "").strip() or DEFAULT_ACCOUNT_ID
+    if account == PUBLIC_ACCOUNT_ID:
+        return [PUBLIC_ACCOUNT_ID]
+    return [account, PUBLIC_ACCOUNT_ID]

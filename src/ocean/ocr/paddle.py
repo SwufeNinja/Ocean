@@ -238,7 +238,7 @@ def _parse_paddle_error_body(body: str) -> tuple[int | None, str | None]:
 def _encode_multipart_form(
     fields: dict[str, str], files: dict[str, tuple[str, bytes, str]]
 ) -> tuple[bytes, dict[str, str]]:
-    boundary = f"----OceanPaddleOCR{uuid.uuid4().hex}"
+    boundary = f"----OCRAssistantPaddleOCR{uuid.uuid4().hex}"
     chunks: list[bytes] = []
 
     for name, value in fields.items():

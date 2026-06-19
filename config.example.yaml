@@ -58,8 +58,23 @@ llm:
   model: ${LLM_MODEL}
   temperature: 0
   max_tokens: 4096
+  token_limit_field: max_completion_tokens
   timeout_seconds: 120
   retry: 3
+  web_search:
+    enabled: false
+    type: web_search
+    max_keyword: 3
+    force_search: false
+    limit: 3
+
+auth:
+  # Local mode still requires login with local/local.
+  # Set enabled=true and define real users before deploying multi-user mode.
+  enabled: false
+  jwt_secret: ${OCEAN_JWT_SECRET}
+  access_token_minutes: 720
+  users: []
 
 elasticsearch:
   enabled: false

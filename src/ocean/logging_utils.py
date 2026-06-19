@@ -18,5 +18,6 @@ def log(message: str) -> None:
     line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}"
     print(line, flush=True)
     if _log_file:
+        _log_file.parent.mkdir(parents=True, exist_ok=True)
         with _log_file.open("a", encoding="utf-8") as f:
             f.write(line + "\n")

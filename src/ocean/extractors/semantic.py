@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from typing import Any
 
+from ocean.logging_utils import log
 from ocean.llm import OpenAICompatibleClient
 from ocean.models import ExtractionResult, TextChunk
 
@@ -14,31 +16,76 @@ def extract_semantic(
     chunks: list[TextChunk],
     topics: list[dict[str, str]],
     llm_client: OpenAICompatibleClient,
+    failure_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> list[ExtractionResult]:
     results: list[ExtractionResult] = []
     for topic in topics:
         topic_name = topic.get("name", "")
         topic_description = topic.get("description", "")
         for chunk in chunks:
-            response = llm_client.chat(_build_messages(chunk, topic_name, topic_description))
-            items = _parse_items(response)
-            for item in items:
-                result_id = f"S{len(results) + 1:04d}"
-                results.append(
-                    ExtractionResult(
-                        result_id=result_id,
-                        source_file=item.get("source_file") or chunk.source_file,
-                        page_start=int(item.get("page_start") or chunk.page_start),
-                        page_end=int(item.get("page_end") or chunk.page_end),
-                        extraction_method="llm",
-                        topic=topic_name,
-                        relevance=item.get("relevance", ""),
-                        reason=item.get("reason", ""),
-                        text=item.get("text", ""),
-                        metadata={"chunk_id": chunk.chunk_id},
-                    )
+            try:
+                response = llm_client.chat(_build_messages(chunk, topic_name, topic_description))
+                items = _parse_items(response)
+            except Exception as exc:
+                _record_failure(
+                    failure_callback,
+                    chunk=chunk,
+                    topic=topic_name,
+                    error=exc,
                 )
+                continue
+            for item in items:
+                try:
+                    result_id = f"S{len(results) + 1:04d}"
+                    results.append(
+                        ExtractionResult(
+                            result_id=result_id,
+                            source_file=item.get("source_file") or chunk.source_file,
+                            page_start=int(item.get("page_start") or chunk.page_start),
+                            page_end=int(item.get("page_end") or chunk.page_end),
+                            extraction_method="llm",
+                            topic=topic_name,
+                            relevance=item.get("relevance", ""),
+                            reason=item.get("reason", ""),
+                            text=item.get("text", ""),
+                            metadata={"chunk_id": chunk.chunk_id},
+                        )
+                    )
+                except Exception as exc:
+                    _record_failure(
+                        failure_callback,
+                        chunk=chunk,
+                        topic=topic_name,
+                        error=exc,
+                        item=item,
+                    )
     return [result for result in results if result.text.strip()]
+
+
+def _record_failure(
+    failure_callback: Callable[[dict[str, Any]], None] | None,
+    *,
+    chunk: TextChunk,
+    topic: str,
+    error: Exception,
+    item: dict[str, Any] | None = None,
+) -> None:
+    failure = {
+        "source_file": chunk.source_file,
+        "chunk_id": chunk.chunk_id,
+        "page_start": chunk.page_start,
+        "page_end": chunk.page_end,
+        "topic": topic,
+        "error": str(error),
+    }
+    if item is not None:
+        failure["item"] = item
+    if failure_callback is not None:
+        failure_callback(failure)
+    log(
+        f"Semantic extraction failed for {chunk.source_file} "
+        f"{chunk.chunk_id} pages {chunk.page_start}-{chunk.page_end}: {error}"
+    )
 
 
 def _build_messages(chunk: TextChunk, topic_name: str, topic_description: str) -> list[dict[str, str]]:

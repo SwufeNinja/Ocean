@@ -8,8 +8,15 @@ from ocean.models import ExtractionResult, OcrDocument
 def write_ocr_markdown(document: OcrDocument, output_path: str | Path) -> None:
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    lines = [f"# {document.source_file}", "", f"<!-- ocr_engine: {document.ocr_engine} -->", ""]
+    lines = [
+        f"# {document.source_file}",
+        "",
+        f"<!-- source_file: {document.source_file} -->",
+        f"<!-- ocr_engine: {document.ocr_engine} -->",
+        "",
+    ]
     for page in document.pages:
+        lines.extend([f"## Page {page.page_number}", ""])
         if page.text.strip():
             lines.extend([page.text.strip(), ""])
     path.write_text("\n".join(lines), encoding="utf-8")

@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import copy
+import base64
+import binascii
 import hashlib
+import hmac
+import json
 import math
 import os
 import re
+import time
 import threading
 import uuid
 from dataclasses import dataclass, field
@@ -34,13 +39,13 @@ from ocean.storage.elasticsearch import (
 )
 
 try:
-    from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
+    from fastapi import Body, FastAPI, File, Form, Header, HTTPException, UploadFile
     from fastapi.staticfiles import StaticFiles
-    from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
+    from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, StreamingResponse
 except ImportError:  # pragma: no cover
-    Body = FastAPI = File = Form = HTTPException = UploadFile = None  # type: ignore[assignment]
+    Body = FastAPI = File = Form = Header = HTTPException = UploadFile = None  # type: ignore[assignment]
     StaticFiles = None  # type: ignore[assignment]
-    FileResponse = HTMLResponse = PlainTextResponse = None  # type: ignore[assignment]
+    FileResponse = HTMLResponse = PlainTextResponse = StreamingResponse = None  # type: ignore[assignment]
 
 
 ENGINE_LABELS = {
@@ -48,6 +53,11 @@ ENGINE_LABELS = {
     "mineru": "MinerU",
 }
 DEFAULT_ENGINE = "mineru"
+DEFAULT_MAX_CONTEXT_DOCUMENTS = 5
+DEFAULT_MAX_DOCUMENT_CONTEXT_CHARS = 30000
+DEFAULT_MAX_HISTORY_MESSAGES = 20
+LLM_CONTEXT_MODE_NONE = "none"
+LLM_CONTEXT_MODE_DOCUMENTS = "documents"
 ENGINE_ALIASES = {
     "paddle": "paddleocr",
     "paddleocr": "paddleocr",
@@ -137,18 +147,30 @@ class LlmConversation:
     title: str
     account_id: str = DEFAULT_ACCOUNT_ID
     knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID
+    origin: str = "global"
     system_prompt: str = ""
+    context_mode: str = LLM_CONTEXT_MODE_NONE
+    context_documents: list[dict[str, Any]] = field(default_factory=list)
     messages: list[ChatMessage] = field(default_factory=list)
     created_at: str = field(default_factory=lambda: _now())
     updated_at: str = field(default_factory=lambda: _now())
 
     def to_dict(self, *, include_messages: bool = True) -> dict[str, Any]:
+        context_documents = [dict(document) for document in self.context_documents]
         data: dict[str, Any] = {
             "conversation_id": self.conversation_id,
             "account_id": self.account_id,
             "knowledge_base_id": self.knowledge_base_id,
             "title": self.title,
+            "origin": self.origin,
             "system_prompt": self.system_prompt,
+            "context_mode": self.context_mode,
+            "context_document_ids": [
+                str(document.get("document_id") or "")
+                for document in context_documents
+                if str(document.get("document_id") or "").strip()
+            ],
+            "context_documents": context_documents,
             "message_count": len(self.messages),
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -158,11 +180,28 @@ class LlmConversation:
         return data
 
 
+@dataclass(frozen=True, slots=True)
+class AuthenticatedUser:
+    username: str
+    account_id: str
+    role: str = "user"
+    display_name: str = ""
+    authenticated: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "username": self.username,
+            "account_id": self.account_id,
+            "role": self.role,
+            "display_name": self.display_name,
+        }
+
+
 def make_app(config: dict[str, Any], output_dir: str | Path = "./outputs"):
     if Body is None or FastAPI is None or File is None or Form is None or HTTPException is None or UploadFile is None:
         raise RuntimeError("Web UI dependencies are missing. Run: pip install -e .")
 
-    app = FastAPI(title="Ocean OCR Web")
+    app = FastAPI(title="OCR Assistant Web")
     frontend_dist = _frontend_dist_root()
     frontend_index = frontend_dist / "index.html"
     frontend_assets = frontend_dist / "assets"
@@ -178,6 +217,7 @@ def make_app(config: dict[str, Any], output_dir: str | Path = "./outputs"):
     ocr_lock = threading.Lock()
     llm_conversations: dict[str, LlmConversation] = {}
     llm_lock = threading.Lock()
+    auth_config = _auth_config(config)
 
     @app.get("/", response_class=HTMLResponse)
     def index() -> str:
@@ -187,6 +227,40 @@ def make_app(config: dict[str, Any], output_dir: str | Path = "./outputs"):
                 detail="Frontend build is missing. Run npm run build in the frontend directory.",
             )
         return frontend_index.read_text(encoding="utf-8")
+
+    @app.post("/api/auth/login")
+    def login(payload: dict[str, Any] | None = Body(default=None)) -> dict[str, Any]:
+        payload = payload or {}
+        username = _payload_text(payload, "username")
+        password = str(payload.get("password") or "")
+        if _auth_enabled(auth_config):
+            user_config = _find_auth_user(auth_config, username)
+            if not user_config or not _verify_password(password, str(user_config.get("password_hash") or "")):
+                raise HTTPException(status_code=401, detail="Invalid username or password")
+            user = _user_from_config(user_config)
+        else:
+            if username != DEFAULT_ACCOUNT_ID or password != DEFAULT_ACCOUNT_ID:
+                raise HTTPException(status_code=401, detail="Invalid username or password")
+            user = _local_mode_user()
+        token = _encode_token(user, auth_config)
+        return {
+            "access_token": token,
+            "token_type": "bearer",
+            "auth_enabled": _auth_enabled(auth_config),
+            "user": user.to_dict(),
+        }
+
+    @app.get("/api/auth/me")
+    def get_current_user(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+        user = _current_user(auth_config, authorization)
+        return {
+            "auth_enabled": _auth_enabled(auth_config),
+            "user": user.to_dict(),
+        }
+
+    @app.post("/api/auth/logout")
+    def logout() -> dict[str, Any]:
+        return {"ok": True}
 
     @app.get("/api/engines")
     def list_engines() -> dict[str, Any]:
@@ -200,13 +274,15 @@ def make_app(config: dict[str, Any], output_dir: str | Path = "./outputs"):
 
     @app.get("/api/documents")
     def list_documents(
-        account_id: str = DEFAULT_ACCOUNT_ID,
+        account_id: str | None = None,
         knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
         q: str = "",
         limit: int = 100,
+        authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
         store = _require_document_store(document_store)
-        scoped_account_id = _scope_id(account_id, DEFAULT_ACCOUNT_ID)
+        current_user = _current_user(auth_config, authorization)
+        scoped_account_id = _authorized_account_id(current_user, account_id)
         scoped_knowledge_base_id = _scope_id(knowledge_base_id, DEFAULT_KNOWLEDGE_BASE_ID)
         records = store.list_documents(
             account_id=scoped_account_id,
@@ -227,12 +303,14 @@ def make_app(config: dict[str, Any], output_dir: str | Path = "./outputs"):
     @app.get("/api/documents/{document_id}/markdown", response_class=PlainTextResponse)
     def get_document_markdown(
         document_id: str,
-        account_id: str = DEFAULT_ACCOUNT_ID,
+        account_id: str | None = None,
         knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
+        authorization: str | None = Header(default=None),
     ) -> str:
         store = _require_document_store(document_store)
+        current_user = _current_user(auth_config, authorization)
         markdown = store.get_markdown(
-            account_id=_scope_id(account_id, DEFAULT_ACCOUNT_ID),
+            account_id=_authorized_account_id(current_user, account_id),
             knowledge_base_id=_scope_id(knowledge_base_id, DEFAULT_KNOWLEDGE_BASE_ID),
             document_id=document_id,
         )
@@ -243,11 +321,13 @@ def make_app(config: dict[str, Any], output_dir: str | Path = "./outputs"):
     @app.get("/api/documents/{document_id}/pages")
     def get_document_pages(
         document_id: str,
-        account_id: str = DEFAULT_ACCOUNT_ID,
+        account_id: str | None = None,
         knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
+        authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
         store = _require_document_store(document_store)
-        scoped_account_id = _scope_id(account_id, DEFAULT_ACCOUNT_ID)
+        current_user = _current_user(auth_config, authorization)
+        scoped_account_id = _authorized_account_id(current_user, account_id)
         scoped_knowledge_base_id = _scope_id(knowledge_base_id, DEFAULT_KNOWLEDGE_BASE_ID)
         document = store.load_ocr_document(
             account_id=scoped_account_id,
@@ -268,11 +348,13 @@ def make_app(config: dict[str, Any], output_dir: str | Path = "./outputs"):
     @app.get("/api/documents/{document_id}/download")
     def download_document_markdown(
         document_id: str,
-        account_id: str = DEFAULT_ACCOUNT_ID,
+        account_id: str | None = None,
         knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
+        authorization: str | None = Header(default=None),
     ):
         store = _require_document_store(document_store)
-        scoped_account_id = _scope_id(account_id, DEFAULT_ACCOUNT_ID)
+        current_user = _current_user(auth_config, authorization)
+        scoped_account_id = _authorized_account_id(current_user, account_id)
         scoped_knowledge_base_id = _scope_id(knowledge_base_id, DEFAULT_KNOWLEDGE_BASE_ID)
         record = store.get_document(
             account_id=scoped_account_id,
@@ -296,7 +378,7 @@ def make_app(config: dict[str, Any], output_dir: str | Path = "./outputs"):
     @app.post("/api/documents/{document_id}/extract-keywords")
     def extract_document_keywords(
         document_id: str,
-        account_id: str = Form(DEFAULT_ACCOUNT_ID),
+        account_id: str | None = Form(default=None),
         knowledge_base_id: str = Form(DEFAULT_KNOWLEDGE_BASE_ID),
         keywords: str = Form(...),
         match_mode: str = Form("any"),
@@ -307,10 +389,12 @@ def make_app(config: dict[str, Any], output_dir: str | Path = "./outputs"):
         case_sensitive: bool = Form(True),
         normalize_chinese: bool = Form(False),
         deduplicate: bool = Form(True),
+        authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
         store = _require_document_store(document_store)
+        current_user = _current_user(auth_config, authorization)
         document = store.load_ocr_document(
-            account_id=_scope_id(account_id, DEFAULT_ACCOUNT_ID),
+            account_id=_authorized_account_id(current_user, account_id),
             knowledge_base_id=_scope_id(knowledge_base_id, DEFAULT_KNOWLEDGE_BASE_ID),
             document_id=document_id,
         )
@@ -338,22 +422,51 @@ def make_app(config: dict[str, Any], output_dir: str | Path = "./outputs"):
             "model": llm_config.get("model") or "",
             "temperature": float(llm_config.get("temperature", 0)),
             "max_tokens": int(llm_config.get("max_tokens", 4096)),
+            "web_search_enabled": _llm_web_search_options(config) is not None,
         }
 
     @app.get("/api/llm/conversations")
     def list_llm_conversations(
-        account_id: str = DEFAULT_ACCOUNT_ID,
+        account_id: str | None = None,
         knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
+        document_id: str = "",
+        context_mode: str = "",
         limit: int = 100,
+        authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
-        scoped_account_id = _scope_id(account_id, DEFAULT_ACCOUNT_ID)
+        current_user = _current_user(auth_config, authorization)
+        scoped_account_id = _authorized_account_id(current_user, account_id)
         scoped_knowledge_base_id = _scope_id(knowledge_base_id, DEFAULT_KNOWLEDGE_BASE_ID)
+        scoped_document_id = str(document_id or "").strip()
+        scoped_context_mode = _normalize_llm_context_mode_filter(context_mode)
+        if _llm_store_enabled(document_store):
+            records = document_store.list_llm_conversations(
+                {
+                    "account_id": scoped_account_id,
+                    "knowledge_base_id": scoped_knowledge_base_id,
+                    "document_id": scoped_document_id,
+                    "context_mode": scoped_context_mode,
+                    "limit": limit,
+                }
+            )
+            return {
+                "account_id": scoped_account_id,
+                "knowledge_base_id": scoped_knowledge_base_id,
+                "count": len(records),
+                "conversations": [_llm_record_to_api(record, include_messages=False) for record in records],
+            }
+
         with llm_lock:
             conversations = [
                 conversation
                 for conversation in llm_conversations.values()
-                if conversation.account_id == scoped_account_id
-                and conversation.knowledge_base_id == scoped_knowledge_base_id
+                if _llm_conversation_matches(
+                    conversation,
+                    account_id=scoped_account_id,
+                    knowledge_base_id=scoped_knowledge_base_id,
+                    document_id=scoped_document_id,
+                    context_mode=scoped_context_mode,
+                )
             ]
             conversations.sort(key=lambda conversation: conversation.updated_at, reverse=True)
             limited = conversations[: max(1, min(int(limit), 500))]
@@ -368,22 +481,97 @@ def make_app(config: dict[str, Any], output_dir: str | Path = "./outputs"):
             }
 
     @app.post("/api/llm/conversations")
-    def create_llm_conversation(payload: dict[str, Any] | None = Body(default=None)) -> dict[str, Any]:
-        conversation = _create_llm_conversation(payload or {}, config)
+    def create_llm_conversation(
+        payload: dict[str, Any] | None = Body(default=None),
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        current_user = _current_user(auth_config, authorization)
+        payload = payload or {}
+        conversation = _create_llm_conversation(
+            payload,
+            config,
+            account_id=_authorized_account_id(current_user, payload.get("account_id")),
+            document_store=document_store,
+        )
+        if _llm_store_enabled(document_store):
+            saved = document_store.save_llm_conversation(_llm_conversation_record(conversation, config))
+            if conversation.messages:
+                now = _es_now()
+                document_store.append_llm_messages(
+                    {
+                        "conversation_id": conversation.conversation_id,
+                        "account_id": conversation.account_id,
+                        "knowledge_base_id": conversation.knowledge_base_id,
+                        "messages": [
+                            {
+                                "message_id": message.message_id,
+                                "role": message.role,
+                                "content": message.content,
+                                "created_at": now,
+                            }
+                            for message in conversation.messages
+                        ],
+                        "message_count": len(conversation.messages),
+                    }
+                )
+                saved = document_store.get_llm_conversation(
+                    {
+                        "conversation_id": conversation.conversation_id,
+                        "account_id": conversation.account_id,
+                        "knowledge_base_id": conversation.knowledge_base_id,
+                        "include_messages": True,
+                    }
+                ) or saved
+            return _llm_record_to_api(saved)
+
         with llm_lock:
             llm_conversations[conversation.conversation_id] = conversation
         return conversation.to_dict()
 
     @app.get("/api/llm/conversations/{conversation_id}")
-    def get_llm_conversation(conversation_id: str) -> dict[str, Any]:
+    def get_llm_conversation(
+        conversation_id: str,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        current_user = _current_user(auth_config, authorization)
+        if _llm_store_enabled(document_store):
+            record = document_store.get_llm_conversation(
+                {
+                    "conversation_id": conversation_id,
+                    "account_id": current_user.account_id,
+                    "include_messages": True,
+                }
+            )
+            if record is None:
+                raise HTTPException(status_code=404, detail="LLM conversation does not exist")
+            return _llm_record_to_api(record)
+
         conversation = _get_llm_conversation_or_404(conversation_id, llm_conversations, llm_lock)
+        _authorize_account_match(current_user, conversation.account_id)
         return conversation.to_dict()
 
     @app.delete("/api/llm/conversations/{conversation_id}")
-    def delete_llm_conversation(conversation_id: str) -> dict[str, Any]:
-        with llm_lock:
-            if conversation_id not in llm_conversations:
+    def delete_llm_conversation(
+        conversation_id: str,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        current_user = _current_user(auth_config, authorization)
+        if _llm_store_enabled(document_store):
+            deleted = document_store.soft_delete_llm_conversation(
+                {
+                    "conversation_id": conversation_id,
+                    "account_id": current_user.account_id,
+                }
+            )
+            if deleted is None:
                 raise HTTPException(status_code=404, detail="LLM conversation does not exist")
+            return {"deleted": True, "conversation_id": conversation_id}
+
+        with llm_lock:
+            conversation = llm_conversations.get(conversation_id)
+            if conversation is None:
+                raise HTTPException(status_code=404, detail="LLM conversation does not exist")
+            _authorize_account_match(current_user, conversation.account_id)
             del llm_conversations[conversation_id]
         return {"deleted": True, "conversation_id": conversation_id}
 
@@ -391,7 +579,9 @@ def make_app(config: dict[str, Any], output_dir: str | Path = "./outputs"):
     def send_llm_message(
         conversation_id: str,
         payload: dict[str, Any] | None = Body(default=None),
+        authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
+        current_user = _current_user(auth_config, authorization)
         payload = payload or {}
         content = _payload_text(payload, "content", "message")
         if not content:
@@ -400,14 +590,43 @@ def make_app(config: dict[str, Any], output_dir: str | Path = "./outputs"):
         if options is not None and not isinstance(options, dict):
             raise HTTPException(status_code=400, detail="options must be an object")
 
-        with llm_lock:
-            conversation = llm_conversations.get(conversation_id)
-            if conversation is None:
+        if _llm_store_enabled(document_store):
+            record = document_store.get_llm_conversation(
+                {
+                    "conversation_id": conversation_id,
+                    "account_id": current_user.account_id,
+                    "include_messages": True,
+                }
+            )
+            if record is None:
                 raise HTTPException(status_code=404, detail="LLM conversation does not exist")
-            llm_messages = _conversation_messages_for_llm(conversation, content)
+            conversation_snapshot = _llm_conversation_from_record(record)
+        else:
+            with llm_lock:
+                conversation = llm_conversations.get(conversation_id)
+                if conversation is None:
+                    raise HTTPException(status_code=404, detail="LLM conversation does not exist")
+                _authorize_account_match(current_user, conversation.account_id)
+                conversation_snapshot = copy.deepcopy(conversation)
+
+        conversation_snapshot = _conversation_with_context_update(
+            conversation_snapshot,
+            payload,
+            config=config,
+            document_store=document_store,
+        )
+        llm_messages = _conversation_messages_for_llm(
+            conversation_snapshot,
+            content,
+            config=config,
+            document_store=document_store,
+        )
 
         try:
-            assistant_content = _create_llm_client(config).chat(llm_messages, options=options)
+            assistant_content = _create_llm_client(config).chat(
+                llm_messages,
+                options=_llm_chat_options(config, options),
+            )
         except ValueError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         except RuntimeError as exc:
@@ -415,12 +634,75 @@ def make_app(config: dict[str, Any], output_dir: str | Path = "./outputs"):
 
         user_message = ChatMessage(role="user", content=content)
         assistant_message = ChatMessage(role="assistant", content=assistant_content)
+        if _llm_store_enabled(document_store):
+            now = _es_now()
+            title_update = (
+                _conversation_title(content)
+                if _is_default_llm_title(conversation_snapshot.title)
+                else conversation_snapshot.title
+            )
+            conversation_updates = {
+                "title": title_update,
+                "context_mode": conversation_snapshot.context_mode,
+                "context_document_ids": [
+                    str(document.get("document_id") or "")
+                    for document in conversation_snapshot.context_documents
+                    if str(document.get("document_id") or "").strip()
+                ],
+                "context_documents": [dict(document) for document in conversation_snapshot.context_documents],
+            }
+            document_store.append_llm_messages(
+                {
+                    "conversation_id": conversation_snapshot.conversation_id,
+                    "account_id": conversation_snapshot.account_id,
+                    "knowledge_base_id": conversation_snapshot.knowledge_base_id,
+                    "messages": [
+                        {
+                            "message_id": user_message.message_id,
+                            "role": user_message.role,
+                            "content": user_message.content,
+                            "created_at": now,
+                        },
+                        {
+                            "message_id": assistant_message.message_id,
+                            "role": assistant_message.role,
+                            "content": assistant_message.content,
+                            "created_at": now,
+                        },
+                    ],
+                    "conversation_updates": conversation_updates,
+                }
+            )
+            updated = document_store.get_llm_conversation(
+                {
+                    "conversation_id": conversation_snapshot.conversation_id,
+                    "account_id": conversation_snapshot.account_id,
+                    "knowledge_base_id": conversation_snapshot.knowledge_base_id,
+                    "include_messages": True,
+                }
+            )
+            if updated is None:
+                raise HTTPException(status_code=404, detail="LLM conversation does not exist")
+            return {
+                "conversation": _llm_api_with_appended_messages(
+                    updated,
+                    conversation_snapshot,
+                    user_message,
+                    assistant_message,
+                ),
+                "user_message": user_message.to_dict(),
+                "assistant_message": assistant_message.to_dict(),
+            }
+
         with llm_lock:
             conversation = llm_conversations.get(conversation_id)
             if conversation is None:
                 raise HTTPException(status_code=404, detail="LLM conversation does not exist")
+            _authorize_account_match(current_user, conversation.account_id)
+            conversation.context_documents = [dict(document) for document in conversation_snapshot.context_documents]
+            conversation.context_mode = conversation_snapshot.context_mode
             conversation.messages.extend([user_message, assistant_message])
-            if conversation.title == _default_llm_title():
+            if _is_default_llm_title(conversation.title):
                 conversation.title = _conversation_title(content)
             conversation.updated_at = _now()
             return {
@@ -429,13 +711,164 @@ def make_app(config: dict[str, Any], output_dir: str | Path = "./outputs"):
                 "assistant_message": assistant_message.to_dict(),
             }
 
+    @app.post("/api/llm/conversations/{conversation_id}/messages/stream")
+    def stream_llm_message(
+        conversation_id: str,
+        payload: dict[str, Any] | None = Body(default=None),
+        authorization: str | None = Header(default=None),
+    ) -> StreamingResponse:
+        current_user = _current_user(auth_config, authorization)
+        payload = payload or {}
+        content = _payload_text(payload, "content", "message")
+        if not content:
+            raise HTTPException(status_code=400, detail="Message content is required")
+        options = payload.get("options")
+        if options is not None and not isinstance(options, dict):
+            raise HTTPException(status_code=400, detail="options must be an object")
+
+        if _llm_store_enabled(document_store):
+            record = document_store.get_llm_conversation(
+                {
+                    "conversation_id": conversation_id,
+                    "account_id": current_user.account_id,
+                    "include_messages": True,
+                }
+            )
+            if record is None:
+                raise HTTPException(status_code=404, detail="LLM conversation does not exist")
+            conversation_snapshot = _llm_conversation_from_record(record)
+        else:
+            with llm_lock:
+                conversation = llm_conversations.get(conversation_id)
+                if conversation is None:
+                    raise HTTPException(status_code=404, detail="LLM conversation does not exist")
+                _authorize_account_match(current_user, conversation.account_id)
+                conversation_snapshot = copy.deepcopy(conversation)
+
+        conversation_snapshot = _conversation_with_context_update(
+            conversation_snapshot,
+            payload,
+            config=config,
+            document_store=document_store,
+        )
+        llm_messages = _conversation_messages_for_llm(
+            conversation_snapshot,
+            content,
+            config=config,
+            document_store=document_store,
+        )
+        user_message = ChatMessage(role="user", content=content)
+        assistant_message = ChatMessage(role="assistant", content="")
+
+        def event_stream():
+            assistant_parts: list[str] = []
+            try:
+                for delta in _create_llm_client(config).stream_chat(
+                    llm_messages,
+                    options=_llm_chat_options(config, options),
+                ):
+                    assistant_parts.append(delta)
+                    yield _sse_event("delta", {"delta": delta})
+            except ValueError as exc:
+                yield _sse_event("error", {"detail": str(exc), "status": 503})
+                return
+            except RuntimeError as exc:
+                yield _sse_event("error", {"detail": str(exc), "status": 502})
+                return
+
+            assistant_message.content = "".join(assistant_parts)
+            if _llm_store_enabled(document_store):
+                now = _es_now()
+                title_update = (
+                    _conversation_title(content)
+                    if _is_default_llm_title(conversation_snapshot.title)
+                    else conversation_snapshot.title
+                )
+                conversation_updates = {
+                    "title": title_update,
+                    "context_mode": conversation_snapshot.context_mode,
+                    "context_document_ids": [
+                        str(document.get("document_id") or "")
+                        for document in conversation_snapshot.context_documents
+                        if str(document.get("document_id") or "").strip()
+                    ],
+                    "context_documents": [dict(document) for document in conversation_snapshot.context_documents],
+                }
+                document_store.append_llm_messages(
+                    {
+                        "conversation_id": conversation_snapshot.conversation_id,
+                        "account_id": conversation_snapshot.account_id,
+                        "knowledge_base_id": conversation_snapshot.knowledge_base_id,
+                        "messages": [
+                            {
+                                "message_id": user_message.message_id,
+                                "role": user_message.role,
+                                "content": user_message.content,
+                                "created_at": now,
+                            },
+                            {
+                                "message_id": assistant_message.message_id,
+                                "role": assistant_message.role,
+                                "content": assistant_message.content,
+                                "created_at": now,
+                            },
+                        ],
+                        "conversation_updates": conversation_updates,
+                    }
+                )
+                updated = document_store.get_llm_conversation(
+                    {
+                        "conversation_id": conversation_snapshot.conversation_id,
+                        "account_id": conversation_snapshot.account_id,
+                        "knowledge_base_id": conversation_snapshot.knowledge_base_id,
+                        "include_messages": True,
+                    }
+                )
+                conversation_data = _llm_api_with_appended_messages(
+                    updated,
+                    conversation_snapshot,
+                    user_message,
+                    assistant_message,
+                )
+            else:
+                with llm_lock:
+                    conversation = llm_conversations.get(conversation_id)
+                    if conversation is None:
+                        yield _sse_event("error", {"detail": "LLM conversation does not exist", "status": 404})
+                        return
+                    _authorize_account_match(current_user, conversation.account_id)
+                    conversation.context_documents = [dict(document) for document in conversation_snapshot.context_documents]
+                    conversation.context_mode = conversation_snapshot.context_mode
+                    conversation.messages.extend([user_message, assistant_message])
+                    if _is_default_llm_title(conversation.title):
+                        conversation.title = _conversation_title(content)
+                    conversation.updated_at = _now()
+                    conversation_data = conversation.to_dict()
+
+            yield _sse_event(
+                "done",
+                {
+                    "conversation": conversation_data,
+                    "user_message": user_message.to_dict(),
+                    "assistant_message": assistant_message.to_dict(),
+                },
+            )
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
     @app.post("/api/jobs")
     async def create_job(
         file: UploadFile = File(...),
         engine: str = Form(DEFAULT_ENGINE),
-        account_id: str = Form(DEFAULT_ACCOUNT_ID),
+        account_id: str | None = Form(default=None),
         knowledge_base_id: str = Form(DEFAULT_KNOWLEDGE_BASE_ID),
+        authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
+        current_user = _current_user(auth_config, authorization)
         selected_engine = _normalize_engine(engine)
         if not _is_pdf_upload(file):
             raise HTTPException(status_code=400, detail="只支持 PDF 文件")
@@ -444,11 +877,12 @@ def make_app(config: dict[str, Any], output_dir: str | Path = "./outputs"):
             selected_engine,
             web_root,
             upload_root,
-            account_id=_scope_id(account_id, DEFAULT_ACCOUNT_ID),
+            account_id=_authorized_account_id(current_user, account_id),
             knowledge_base_id=_scope_id(knowledge_base_id, DEFAULT_KNOWLEDGE_BASE_ID),
         )
         with jobs_lock:
             jobs[job.job_id] = job
+        _save_job_snapshot(document_store, job)
 
         thread = threading.Thread(
             target=_run_job,
@@ -462,9 +896,11 @@ def make_app(config: dict[str, Any], output_dir: str | Path = "./outputs"):
     async def create_batch_jobs(
         files: list[UploadFile] = File(...),
         engine: str = Form(DEFAULT_ENGINE),
-        account_id: str = Form(DEFAULT_ACCOUNT_ID),
+        account_id: str | None = Form(default=None),
         knowledge_base_id: str = Form(DEFAULT_KNOWLEDGE_BASE_ID),
+        authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
+        current_user = _current_user(auth_config, authorization)
         selected_engine = _normalize_engine(engine)
         pdf_files = [upload for upload in files if _is_pdf_upload(upload)]
         if not pdf_files:
@@ -480,7 +916,7 @@ def make_app(config: dict[str, Any], output_dir: str | Path = "./outputs"):
                     selected_engine,
                     web_root,
                     upload_root,
-                    account_id=_scope_id(account_id, DEFAULT_ACCOUNT_ID),
+                    account_id=_authorized_account_id(current_user, account_id),
                     knowledge_base_id=_scope_id(knowledge_base_id, DEFAULT_KNOWLEDGE_BASE_ID),
                     batch_id=batch_id,
                     queue_index=index,
@@ -491,6 +927,8 @@ def make_app(config: dict[str, Any], output_dir: str | Path = "./outputs"):
         with jobs_lock:
             for job in created_jobs:
                 jobs[job.job_id] = job
+        for job in created_jobs:
+            _save_job_snapshot(document_store, job)
 
         thread = threading.Thread(
             target=_run_batch_jobs,
@@ -506,16 +944,88 @@ def make_app(config: dict[str, Any], output_dir: str | Path = "./outputs"):
             "jobs": [job.to_dict() for job in created_jobs],
         }
 
+    @app.get("/api/jobs")
+    def list_jobs(
+        account_id: str | None = None,
+        knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
+        state: str = "",
+        limit: int = 100,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        current_user = _current_user(auth_config, authorization)
+        scoped_account_id = _authorized_account_id(current_user, account_id)
+        scoped_knowledge_base_id = _scope_id(knowledge_base_id, DEFAULT_KNOWLEDGE_BASE_ID)
+        states = _parse_job_states(state)
+        merged: dict[str, dict[str, Any]] = {}
+        with jobs_lock:
+            for job in jobs.values():
+                if job.account_id != scoped_account_id or job.knowledge_base_id != scoped_knowledge_base_id:
+                    continue
+                if states and job.state not in states:
+                    continue
+                data = job.to_dict()
+                data["log_tail"] = _read_log_tail(job.log_path)
+                merged[job.job_id] = data
+        if document_store is not None:
+            for record in document_store.list_jobs(
+                account_id=scoped_account_id,
+                knowledge_base_id=scoped_knowledge_base_id,
+                states=states or None,
+                limit=limit,
+            ):
+                job_id = str(record.get("job_id") or "")
+                if job_id and job_id not in merged:
+                    record_state = str(record.get("state") or "").strip().lower()
+                    if record_state in {"queued", "running"}:
+                        continue
+                    merged[job_id] = _job_record_to_api(record, scoped_account_id, scoped_knowledge_base_id)
+        items = sorted(
+            merged.values(),
+            key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""),
+            reverse=True,
+        )[: max(1, min(int(limit), 500))]
+        return {
+            "account_id": scoped_account_id,
+            "knowledge_base_id": scoped_knowledge_base_id,
+            "count": len(items),
+            "jobs": items,
+        }
+
     @app.get("/api/jobs/{job_id}")
-    def get_job(job_id: str) -> dict[str, Any]:
-        job = _get_job_or_404(job_id, jobs, jobs_lock)
+    def get_job(
+        job_id: str,
+        account_id: str | None = None,
+        knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        current_user = _current_user(auth_config, authorization)
+        if _is_document_job_id(job_id):
+            return _get_document_job_or_404(
+                job_id,
+                current_user,
+                document_store,
+                account_id=account_id,
+                knowledge_base_id=knowledge_base_id,
+            )
+        job = _get_job(job_id, jobs, jobs_lock)
+        if job is None:
+            return _get_persisted_job_or_404(
+                job_id,
+                current_user,
+                document_store,
+                account_id=account_id,
+                knowledge_base_id=knowledge_base_id,
+            )
+        _authorize_account_match(current_user, job.account_id)
         data = job.to_dict()
         data["log_tail"] = _read_log_tail(job.log_path)
         return data
 
     @app.get("/api/jobs/{job_id}/markdown", response_class=PlainTextResponse)
-    def get_markdown(job_id: str) -> str:
+    def get_markdown(job_id: str, authorization: str | None = Header(default=None)) -> str:
+        current_user = _current_user(auth_config, authorization)
         job = _get_job_or_404(job_id, jobs, jobs_lock)
+        _authorize_account_match(current_user, job.account_id)
         if job.state != "done":
             raise HTTPException(status_code=404, detail="Markdown 还没有生成")
         if document_store is not None and job.document_id:
@@ -531,8 +1041,10 @@ def make_app(config: dict[str, Any], output_dir: str | Path = "./outputs"):
         return job.markdown_path.read_text(encoding="utf-8")
 
     @app.get("/api/jobs/{job_id}/pages")
-    def get_pages(job_id: str) -> dict[str, Any]:
+    def get_pages(job_id: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+        current_user = _current_user(auth_config, authorization)
         job = _get_job_or_404(job_id, jobs, jobs_lock)
+        _authorize_account_match(current_user, job.account_id)
         if job.state != "done":
             raise HTTPException(status_code=404, detail="OCR pages are not ready")
         document = job.ocr_document
@@ -556,8 +1068,10 @@ def make_app(config: dict[str, Any], output_dir: str | Path = "./outputs"):
         }
 
     @app.get("/api/jobs/{job_id}/download")
-    def download_markdown(job_id: str):
+    def download_markdown(job_id: str, authorization: str | None = Header(default=None)):
+        current_user = _current_user(auth_config, authorization)
         job = _get_job_or_404(job_id, jobs, jobs_lock)
+        _authorize_account_match(current_user, job.account_id)
         if job.state != "done":
             raise HTTPException(status_code=404, detail="Markdown 还没有生成")
         if job.markdown_path and job.markdown_path.exists():
@@ -593,8 +1107,11 @@ def make_app(config: dict[str, Any], output_dir: str | Path = "./outputs"):
         case_sensitive: bool = Form(True),
         normalize_chinese: bool = Form(False),
         deduplicate: bool = Form(True),
+        authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
+        current_user = _current_user(auth_config, authorization)
         job = _get_job_or_404(job_id, jobs, jobs_lock)
+        _authorize_account_match(current_user, job.account_id)
         if job.state == "done" and job.ocr_document is None and document_store is not None and job.document_id:
             document = document_store.load_ocr_document(
                 account_id=job.account_id,
@@ -709,7 +1226,7 @@ def serve(config: dict[str, Any], output_dir: str | Path, host: str = "127.0.0.1
 def main() -> None:
     import argparse
 
-    parser = argparse.ArgumentParser(prog="ocean-web", description="Start Ocean OCR web UI.")
+    parser = argparse.ArgumentParser(prog="ocean-web", description="Start OCR Assistant web UI.")
     parser.add_argument("--config", required=True, help="YAML config path.")
     parser.add_argument("--output", default="./outputs", help="Output directory.")
     parser.add_argument("--host", default="127.0.0.1", help="Web server host.")
@@ -999,6 +1516,7 @@ def _save_job_snapshot(
                 "knowledge_base_id": job.knowledge_base_id,
                 "job_id": job.job_id,
                 "document_id": job.document_id,
+                "batch_id": job.batch_id,
                 "file_name": job.file_name,
                 "type": "ocr",
                 "state": job.state,
@@ -1007,6 +1525,9 @@ def _save_job_snapshot(
                 "error": job.error,
                 "engine": job.engine,
                 "reused": job.reused,
+                "queue_index": job.queue_index,
+                "queue_total": job.queue_total,
+                "total_pages": job.total_pages,
                 "created_at": now,
                 "updated_at": now,
                 "finished_at": now if finished else None,
@@ -1014,6 +1535,201 @@ def _save_job_snapshot(
         )
     except Exception as exc:  # pragma: no cover - depends on external Elasticsearch
         log(f"Failed to save web job snapshot to Elasticsearch: {exc}")
+
+
+def _auth_config(config: dict[str, Any]) -> dict[str, Any]:
+    value = config.get("auth", {})
+    return value if isinstance(value, dict) else {}
+
+
+def _auth_enabled(auth_config: dict[str, Any]) -> bool:
+    return _as_bool(auth_config.get("enabled", False))
+
+
+def _current_user(auth_config: dict[str, Any], authorization: Any = None) -> AuthenticatedUser:
+    token = _bearer_token(authorization)
+    if not token:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    payload = _decode_token(token, auth_config)
+    username = str(payload.get("username") or "").strip()
+    account_id = _scope_id(payload.get("account_id"), "")
+    if not username or not account_id:
+        raise HTTPException(status_code=401, detail="Invalid authentication token")
+
+    if not _auth_enabled(auth_config):
+        if username != DEFAULT_ACCOUNT_ID or account_id != DEFAULT_ACCOUNT_ID:
+            raise HTTPException(status_code=401, detail="Invalid authentication token")
+        return _local_mode_user()
+
+    user_config = _find_auth_user(auth_config, username)
+    if not user_config:
+        raise HTTPException(status_code=401, detail="Invalid authentication token")
+    configured_user = _user_from_config(user_config)
+    if configured_user.account_id != account_id:
+        raise HTTPException(status_code=401, detail="Invalid authentication token")
+    return configured_user
+
+
+def _local_mode_user() -> AuthenticatedUser:
+    return AuthenticatedUser(
+        username=DEFAULT_ACCOUNT_ID,
+        account_id=DEFAULT_ACCOUNT_ID,
+        role="admin",
+        display_name="Local",
+        authenticated=True,
+    )
+
+
+def _authorized_account_id(current_user: AuthenticatedUser, requested_account_id: Any = None) -> str:
+    requested = str(requested_account_id or "").strip()
+    if not current_user.authenticated:
+        return requested or DEFAULT_ACCOUNT_ID
+    if requested and requested != current_user.account_id:
+        raise HTTPException(status_code=403, detail="Account access denied")
+    return current_user.account_id
+
+
+def _authorize_account_match(current_user: AuthenticatedUser, account_id: Any) -> None:
+    if not current_user.authenticated:
+        return
+    if _scope_id(account_id, "") != current_user.account_id:
+        raise HTTPException(status_code=403, detail="Account access denied")
+
+
+def _find_auth_user(auth_config: dict[str, Any], username: str) -> dict[str, Any] | None:
+    normalized = str(username or "").strip()
+    if not normalized:
+        return None
+    users = auth_config.get("users") or []
+    if not isinstance(users, list):
+        return None
+    for user in users:
+        if isinstance(user, dict) and str(user.get("username") or "").strip() == normalized:
+            return user
+    return None
+
+
+def _user_from_config(user_config: dict[str, Any]) -> AuthenticatedUser:
+    return AuthenticatedUser(
+        username=str(user_config.get("username") or "").strip(),
+        account_id=_scope_id(user_config.get("account_id"), DEFAULT_ACCOUNT_ID),
+        role=str(user_config.get("role") or "user").strip() or "user",
+        display_name=str(user_config.get("display_name") or user_config.get("username") or "").strip(),
+        authenticated=True,
+    )
+
+
+def _verify_password(password: str, password_hash: str) -> bool:
+    if not password_hash:
+        return False
+    if password_hash.startswith("sha256:"):
+        expected = password_hash.split(":", 1)[1]
+        actual = hashlib.sha256(password.encode("utf-8")).hexdigest()
+        return hmac.compare_digest(actual, expected)
+    if password_hash.startswith("pbkdf2_sha256$"):
+        return _verify_pbkdf2_sha256(password, password_hash)
+    if password_hash.startswith("$2"):
+        try:
+            import bcrypt
+        except ImportError:
+            return False
+        return bool(bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8")))
+    return False
+
+
+def _verify_pbkdf2_sha256(password: str, password_hash: str) -> bool:
+    try:
+        _, iterations, salt, expected = password_hash.split("$", 3)
+        digest = hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
+            salt.encode("utf-8"),
+            int(iterations),
+        )
+        actual = base64.b64encode(digest).decode("ascii").strip()
+    except (ValueError, TypeError):
+        return False
+    return hmac.compare_digest(actual, expected)
+
+
+def _encode_token(user: AuthenticatedUser, auth_config: dict[str, Any]) -> str:
+    now = int(time.time())
+    expires_in = max(1, int(auth_config.get("access_token_minutes", 720))) * 60
+    payload = {
+        "username": user.username,
+        "account_id": user.account_id,
+        "role": user.role,
+        "iat": now,
+        "exp": now + expires_in,
+    }
+    return _jwt_encode(payload, _jwt_secret(auth_config))
+
+
+def _decode_token(token: str, auth_config: dict[str, Any]) -> dict[str, Any]:
+    payload = _jwt_decode(token, _jwt_secret(auth_config))
+    exp = int(payload.get("exp") or 0)
+    if exp < int(time.time()):
+        raise HTTPException(status_code=401, detail="Authentication token expired")
+    return payload
+
+
+def _jwt_secret(auth_config: dict[str, Any]) -> str:
+    secret = str(auth_config.get("jwt_secret") or "").strip()
+    if not secret and not _auth_enabled(auth_config):
+        return "ocean-local-mode-secret"
+    if not secret:
+        raise HTTPException(status_code=500, detail="auth.jwt_secret is required when authentication is enabled")
+    return secret
+
+
+def _jwt_encode(payload: dict[str, Any], secret: str) -> str:
+    header = {"alg": "HS256", "typ": "JWT"}
+    encoded_header = _base64url_json(header)
+    encoded_payload = _base64url_json(payload)
+    signing_input = f"{encoded_header}.{encoded_payload}".encode("ascii")
+    signature = hmac.new(secret.encode("utf-8"), signing_input, hashlib.sha256).digest()
+    return f"{encoded_header}.{encoded_payload}.{_base64url_encode(signature)}"
+
+
+def _jwt_decode(token: str, secret: str) -> dict[str, Any]:
+    try:
+        encoded_header, encoded_payload, encoded_signature = token.split(".", 2)
+        signing_input = f"{encoded_header}.{encoded_payload}".encode("ascii")
+        expected = hmac.new(secret.encode("utf-8"), signing_input, hashlib.sha256).digest()
+        actual = _base64url_decode(encoded_signature)
+        if not hmac.compare_digest(actual, expected):
+            raise ValueError("bad signature")
+        header = json.loads(_base64url_decode(encoded_header))
+        if header.get("alg") != "HS256":
+            raise ValueError("unsupported algorithm")
+        payload = json.loads(_base64url_decode(encoded_payload))
+    except (ValueError, TypeError, json.JSONDecodeError, binascii.Error):
+        raise HTTPException(status_code=401, detail="Invalid authentication token") from None
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=401, detail="Invalid authentication token")
+    return payload
+
+
+def _base64url_json(value: dict[str, Any]) -> str:
+    return _base64url_encode(json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8"))
+
+
+def _base64url_encode(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
+
+
+def _base64url_decode(value: str) -> bytes:
+    padding = "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode((value + padding).encode("ascii"))
+
+
+def _bearer_token(authorization: Any) -> str:
+    if not isinstance(authorization, str):
+        return ""
+    scheme, _, token = authorization.strip().partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        return ""
+    return token.strip()
 
 
 def _require_document_store(document_store: ElasticsearchDocumentStore | None) -> ElasticsearchDocumentStore:
@@ -1049,6 +1765,161 @@ def _document_record_to_api(
     }
 
 
+def _parse_job_states(value: str | None) -> list[str]:
+    return [
+        item.strip().lower()
+        for item in re.split(r"[,，\s]+", str(value or ""))
+        if item.strip()
+    ]
+
+
+def _job_record_to_api(
+    record: dict[str, Any],
+    account_id: str,
+    knowledge_base_id: str,
+) -> dict[str, Any]:
+    job_id = str(record.get("job_id") or "")
+    document_id = str(record.get("document_id") or "") or None
+    state = str(record.get("state") or "queued").strip().lower() or "queued"
+    progress = int(record.get("progress") or (100 if state in {"done", "failed"} else 0))
+    done_with_document = state == "done" and bool(document_id)
+    query = f"account_id={quote(account_id)}&knowledge_base_id={quote(knowledge_base_id)}"
+    return {
+        "job_id": job_id,
+        "account_id": account_id,
+        "knowledge_base_id": knowledge_base_id,
+        "document_id": document_id,
+        "file_sha256": record.get("file_sha256"),
+        "processing_fingerprint": record.get("processing_fingerprint"),
+        "reused": bool(record.get("reused")),
+        "batch_id": record.get("batch_id"),
+        "file_name": record.get("file_name") or job_id,
+        "engine": record.get("engine") or "",
+        "engine_label": ENGINE_LABELS.get(str(record.get("engine") or ""), str(record.get("engine") or "")),
+        "queue_index": record.get("queue_index"),
+        "queue_total": record.get("queue_total"),
+        "state": state,
+        "progress": progress,
+        "message": record.get("message") or "",
+        "total_pages": record.get("total_pages") or record.get("page_count"),
+        "error": record.get("error"),
+        "markdown_url": f"/api/documents/{quote(document_id)}/markdown?{query}" if done_with_document else None,
+        "download_url": f"/api/documents/{quote(document_id)}/download?{query}" if done_with_document else None,
+        "pages_url": f"/api/documents/{quote(document_id)}/pages?{query}" if done_with_document else None,
+        "created_at": record.get("created_at") or "",
+        "updated_at": record.get("updated_at") or "",
+        "log_tail": [],
+    }
+
+
+def _get_persisted_job_or_404(
+    job_id: str,
+    current_user: AuthenticatedUser,
+    document_store: ElasticsearchDocumentStore | None,
+    *,
+    account_id: str | None = None,
+    knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
+) -> dict[str, Any]:
+    if document_store is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    scoped_account_id = _authorized_account_id(current_user, account_id)
+    scoped_knowledge_base_id = _scope_id(knowledge_base_id, DEFAULT_KNOWLEDGE_BASE_ID)
+    record = document_store.get_job(
+        account_id=scoped_account_id,
+        knowledge_base_id=scoped_knowledge_base_id,
+        job_id=job_id,
+    )
+    if record is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    state = str(record.get("state") or "").strip().lower()
+    if state in {"queued", "running"}:
+        record = {
+            **record,
+            "state": "failed",
+            "progress": 100,
+            "message": "任务不存在或已取消",
+            "error": "任务不存在或已取消",
+            "updated_at": _es_now(),
+            "finished_at": _es_now(),
+        }
+        try:
+            document_store.save_job(record)
+        except Exception as exc:  # pragma: no cover - depends on external Elasticsearch
+            log(f"Failed to mark orphaned web job as failed: {exc}")
+    return _job_record_to_api(record, scoped_account_id, scoped_knowledge_base_id)
+
+
+def _is_document_job_id(job_id: str) -> bool:
+    return str(job_id or "").startswith("document:")
+
+
+def _document_id_from_job_id(job_id: str) -> str:
+    return str(job_id or "").split(":", 1)[1].strip() if _is_document_job_id(job_id) else ""
+
+
+def _get_document_job_or_404(
+    job_id: str,
+    current_user: AuthenticatedUser,
+    document_store: ElasticsearchDocumentStore | None,
+    *,
+    account_id: str | None = None,
+    knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
+) -> dict[str, Any]:
+    store = _require_document_store(document_store)
+    scoped_account_id = _authorized_account_id(current_user, account_id)
+    scoped_knowledge_base_id = _scope_id(knowledge_base_id, DEFAULT_KNOWLEDGE_BASE_ID)
+    document_id = _document_id_from_job_id(job_id)
+    if not document_id:
+        raise HTTPException(status_code=404, detail="Document does not exist")
+    record = store.get_document(
+        account_id=scoped_account_id,
+        knowledge_base_id=scoped_knowledge_base_id,
+        document_id=document_id,
+    )
+    if record is None:
+        raise HTTPException(status_code=404, detail="Document does not exist")
+    return _document_record_to_job_api(record, scoped_account_id, scoped_knowledge_base_id)
+
+
+def _document_record_to_job_api(
+    record: dict[str, Any],
+    account_id: str,
+    knowledge_base_id: str,
+) -> dict[str, Any]:
+    document_id = str(record.get("document_id") or "")
+    status = str(record.get("status") or "").strip().lower()
+    state = "done" if status == "done" else "failed" if status == "failed" else "running"
+    progress = 100 if state in {"done", "failed"} else 50
+    query = f"account_id={quote(account_id)}&knowledge_base_id={quote(knowledge_base_id)}"
+    done = state == "done"
+    return {
+        "job_id": f"document:{document_id}",
+        "account_id": account_id,
+        "knowledge_base_id": knowledge_base_id,
+        "document_id": document_id,
+        "file_sha256": record.get("file_sha256"),
+        "processing_fingerprint": record.get("processing_fingerprint"),
+        "reused": True,
+        "batch_id": None,
+        "file_name": record.get("file_name") or document_id,
+        "engine": record.get("ocr_engine") or "library",
+        "engine_label": record.get("ocr_engine") or "Knowledge Base",
+        "queue_index": None,
+        "queue_total": None,
+        "state": state,
+        "progress": progress,
+        "message": "Loaded from knowledge base" if done else f"Document status: {status or state}",
+        "total_pages": record.get("page_count"),
+        "error": record.get("error") if state == "failed" else None,
+        "markdown_url": f"/api/documents/{quote(document_id)}/markdown?{query}" if done else None,
+        "download_url": f"/api/documents/{quote(document_id)}/download?{query}" if done else None,
+        "pages_url": f"/api/documents/{quote(document_id)}/pages?{query}" if done else None,
+        "created_at": record.get("created_at") or "",
+        "updated_at": record.get("updated_at") or record.get("processed_at") or "",
+        "log_tail": [],
+    }
+
+
 def _extract_keywords_response(
     *,
     document: OcrDocument,
@@ -1064,13 +1935,13 @@ def _extract_keywords_response(
 ) -> dict[str, Any]:
     parsed_keywords = _parse_keywords(keywords)
     if not parsed_keywords:
-        raise HTTPException(status_code=400, detail="璇疯嚦灏戣緭鍏ヤ竴涓叧閿瘝")
+        raise HTTPException(status_code=400, detail="请至少输入一个关键词")
     normalized_mode = str(match_mode or "any").lower()
     if normalized_mode not in {"any", "all"}:
-        raise HTTPException(status_code=400, detail="match_mode 鍙敮鎸?any 鎴?all")
+        raise HTTPException(status_code=400, detail="match_mode 只支持 any 或 all")
     normalized_granularity = str(granularity or "paragraph").lower()
     if normalized_granularity not in {"paragraph", "page"}:
-        raise HTTPException(status_code=400, detail="granularity 鍙敮鎸?paragraph 鎴?page")
+        raise HTTPException(status_code=400, detail="granularity 只支持 paragraph 或 page")
 
     results = extract_keywords(
         document=document,
@@ -1103,6 +1974,44 @@ def _llm_config(config: dict[str, Any]) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _llm_conversation_config(config: dict[str, Any]) -> dict[str, int]:
+    llm_config = _llm_config(config)
+    conversation_config = llm_config.get("conversation")
+    if not isinstance(conversation_config, dict):
+        conversation_config = {}
+    max_context_documents = _int_config(
+        conversation_config.get("max_context_documents", llm_config.get("max_context_documents")),
+        DEFAULT_MAX_CONTEXT_DOCUMENTS,
+    )
+    return {
+        "max_context_documents": max(1, min(max_context_documents, DEFAULT_MAX_CONTEXT_DOCUMENTS)),
+        "max_document_context_chars": max(
+            1,
+            _int_config(
+                conversation_config.get(
+                    "max_document_context_chars",
+                    llm_config.get("max_document_context_chars"),
+                ),
+                DEFAULT_MAX_DOCUMENT_CONTEXT_CHARS,
+            ),
+        ),
+        "max_history_messages": max(
+            0,
+            _int_config(
+                conversation_config.get("max_history_messages", llm_config.get("max_history_messages")),
+                DEFAULT_MAX_HISTORY_MESSAGES,
+            ),
+        ),
+    }
+
+
+def _int_config(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _llm_config_ready(config: dict[str, Any]) -> bool:
     return bool(config.get("api_base_url") and config.get("api_key") and config.get("model"))
 
@@ -1115,16 +2024,73 @@ def _create_llm_client(config: dict[str, Any]) -> OpenAICompatibleClient:
     return OpenAICompatibleClient.from_config(llm_config)
 
 
-def _create_llm_conversation(payload: dict[str, Any], config: dict[str, Any]) -> LlmConversation:
+def _llm_chat_options(config: dict[str, Any], options: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    merged = dict(options or {})
+    web_search_enabled = merged.pop("web_search_enabled", None)
+    if "tools" in merged or "tool_choice" in merged:
+        return merged or None
+    if web_search_enabled is False:
+        return merged or None
+
+    web_search = _llm_web_search_options(config)
+    if web_search is None:
+        return merged or None
+
+    merged["tools"] = [web_search]
+    merged.setdefault("tool_choice", "auto")
+    return merged
+
+
+def _llm_web_search_options(config: dict[str, Any]) -> dict[str, Any] | None:
     llm_config = _llm_config(config)
+    web_search_config = llm_config.get("web_search")
+    if not isinstance(web_search_config, dict) or not web_search_config.get("enabled"):
+        return None
+
+    tool: dict[str, Any] = {"type": str(web_search_config.get("type") or "web_search")}
+    for key in ("max_keyword", "force_search", "limit"):
+        if key in web_search_config:
+            tool[key] = web_search_config[key]
+    return tool
+
+
+def _create_llm_conversation(
+    payload: dict[str, Any],
+    config: dict[str, Any],
+    *,
+    account_id: str | None = None,
+    knowledge_base_id: str | None = None,
+    document_store: ElasticsearchDocumentStore | None = None,
+) -> LlmConversation:
+    llm_config = _llm_config(config)
+    conversation_config = _llm_conversation_config(config)
     title = _payload_text(payload, "title") or _default_llm_title()
+    origin = _normalize_llm_origin(payload.get("origin"))
     system_prompt = _payload_text(payload, "system_prompt") or str(llm_config.get("system_prompt") or "").strip()
+    scoped_account_id = _scope_id(account_id if account_id is not None else payload.get("account_id"), DEFAULT_ACCOUNT_ID)
+    scoped_knowledge_base_id = _scope_id(
+        knowledge_base_id if knowledge_base_id is not None else payload.get("knowledge_base_id"),
+        DEFAULT_KNOWLEDGE_BASE_ID,
+    )
+    context_document_ids = _parse_llm_context_document_ids(
+        payload,
+        max_documents=conversation_config["max_context_documents"],
+    )
+    context_documents = _load_llm_context_document_snapshots(
+        document_store,
+        account_id=scoped_account_id,
+        knowledge_base_id=scoped_knowledge_base_id,
+        document_ids=context_document_ids,
+    )
     conversation = LlmConversation(
         conversation_id=uuid.uuid4().hex[:12],
         title=title,
-        account_id=_scope_id(payload.get("account_id"), DEFAULT_ACCOUNT_ID),
-        knowledge_base_id=_scope_id(payload.get("knowledge_base_id"), DEFAULT_KNOWLEDGE_BASE_ID),
+        account_id=scoped_account_id,
+        knowledge_base_id=scoped_knowledge_base_id,
+        origin=origin,
         system_prompt=system_prompt,
+        context_mode=LLM_CONTEXT_MODE_DOCUMENTS if context_documents else LLM_CONTEXT_MODE_NONE,
+        context_documents=context_documents,
     )
 
     raw_messages = payload.get("messages")
@@ -1150,15 +2116,357 @@ def _create_llm_conversation(payload: dict[str, Any], config: dict[str, Any]) ->
     return conversation
 
 
-def _conversation_messages_for_llm(conversation: LlmConversation, user_content: str) -> list[dict[str, str]]:
+def _llm_store_enabled(document_store: Any) -> bool:
+    return all(
+        callable(getattr(document_store, method_name, None))
+        for method_name in (
+            "save_llm_conversation",
+            "list_llm_conversations",
+            "get_llm_conversation",
+            "append_llm_messages",
+            "soft_delete_llm_conversation",
+        )
+    )
+
+
+def _llm_conversation_record(conversation: LlmConversation, config: dict[str, Any]) -> dict[str, Any]:
+    llm_config = _llm_config(config)
+    now = _es_now()
+    record = conversation.to_dict(include_messages=False)
+    record.update(
+        {
+            "provider": llm_config.get("provider") or "openai_compatible",
+            "model": llm_config.get("model") or "",
+            "temperature": float(llm_config.get("temperature", 0)),
+            "max_tokens": int(llm_config.get("max_tokens", 4096)),
+            "message_count": len(conversation.messages),
+            "status": "active",
+            "created_at": now,
+            "updated_at": now,
+            "deleted_at": None,
+        }
+    )
+    return record
+
+
+def _llm_record_to_api(record: dict[str, Any], *, include_messages: bool = True) -> dict[str, Any]:
+    context_documents = record.get("context_documents")
+    if not isinstance(context_documents, list):
+        context_documents = []
+    context_document_ids = record.get("context_document_ids")
+    if not isinstance(context_document_ids, list):
+        context_document_ids = [
+            str(document.get("document_id") or "")
+            for document in context_documents
+            if isinstance(document, dict) and str(document.get("document_id") or "").strip()
+        ]
+    messages = record.get("messages")
+    data = {
+        "conversation_id": record.get("conversation_id") or "",
+        "account_id": record.get("account_id") or DEFAULT_ACCOUNT_ID,
+        "knowledge_base_id": record.get("knowledge_base_id") or DEFAULT_KNOWLEDGE_BASE_ID,
+        "title": record.get("title") or _default_llm_title(),
+        "origin": _normalize_llm_origin(record.get("origin"), record=record),
+        "system_prompt": record.get("system_prompt") or "",
+        "context_mode": record.get("context_mode") or (LLM_CONTEXT_MODE_DOCUMENTS if context_document_ids else LLM_CONTEXT_MODE_NONE),
+        "context_document_ids": [str(document_id) for document_id in context_document_ids if str(document_id).strip()],
+        "context_documents": [dict(document) for document in context_documents if isinstance(document, dict)],
+        "message_count": int(record.get("message_count") or (len(messages) if isinstance(messages, list) else 0)),
+        "created_at": record.get("created_at") or "",
+        "updated_at": record.get("updated_at") or "",
+    }
+    if include_messages:
+        data["messages"] = [
+            {
+                "message_id": message.get("message_id") or "",
+                "role": message.get("role") or "",
+                "content": message.get("content") or "",
+                "created_at": message.get("created_at") or "",
+            }
+            for message in (messages if isinstance(messages, list) else [])
+            if isinstance(message, dict)
+        ]
+    return data
+
+
+def _llm_api_with_appended_messages(
+    record: dict[str, Any] | None,
+    conversation_snapshot: LlmConversation,
+    user_message: ChatMessage,
+    assistant_message: ChatMessage,
+) -> dict[str, Any]:
+    data = _llm_record_to_api(record, include_messages=True) if record else conversation_snapshot.to_dict()
+    fallback_messages = [
+        message.to_dict()
+        for message in [
+            *conversation_snapshot.messages,
+            user_message,
+            assistant_message,
+        ]
+    ]
+    if len(data.get("messages") or []) < len(fallback_messages):
+        data["messages"] = fallback_messages
+        data["message_count"] = len(fallback_messages)
+    return data
+
+
+def _llm_conversation_from_record(record: dict[str, Any]) -> LlmConversation:
+    messages = [
+        ChatMessage(
+            role=str(message.get("role") or ""),
+            content=str(message.get("content") or ""),
+            created_at=str(message.get("created_at") or _now()),
+            message_id=str(message.get("message_id") or uuid.uuid4().hex[:12]),
+        )
+        for message in record.get("messages", [])
+        if isinstance(message, dict)
+    ]
+    return LlmConversation(
+        conversation_id=str(record.get("conversation_id") or ""),
+        title=str(record.get("title") or _default_llm_title()),
+        account_id=str(record.get("account_id") or DEFAULT_ACCOUNT_ID),
+        knowledge_base_id=str(record.get("knowledge_base_id") or DEFAULT_KNOWLEDGE_BASE_ID),
+        origin=_normalize_llm_origin(record.get("origin"), record=record),
+        system_prompt=str(record.get("system_prompt") or ""),
+        context_mode=str(record.get("context_mode") or LLM_CONTEXT_MODE_NONE),
+        context_documents=[
+            dict(document)
+            for document in record.get("context_documents", [])
+            if isinstance(document, dict)
+        ],
+        messages=messages,
+        created_at=str(record.get("created_at") or _now()),
+        updated_at=str(record.get("updated_at") or _now()),
+    )
+
+
+def _normalize_llm_origin(value: Any, *, record: dict[str, Any] | None = None) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"reader", "global"}:
+        return normalized
+    if record:
+        metadata = record.get("metadata")
+        if isinstance(metadata, dict):
+            metadata_origin = str(metadata.get("origin") or "").strip().lower()
+            if metadata_origin in {"reader", "global"}:
+                return metadata_origin
+        # Legacy conversations did not store origin. Context-bound legacy
+        # conversations were reader-created in the original UI flow.
+        context_ids = record.get("context_document_ids")
+        context_documents = record.get("context_documents")
+        if (isinstance(context_ids, list) and context_ids) or (isinstance(context_documents, list) and context_documents):
+            return "reader"
+    return "global"
+
+
+def _normalize_llm_context_mode_filter(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        return ""
+    if normalized not in {LLM_CONTEXT_MODE_NONE, LLM_CONTEXT_MODE_DOCUMENTS}:
+        raise HTTPException(status_code=400, detail="context_mode only supports none or documents")
+    return normalized
+
+
+def _llm_conversation_matches(
+    conversation: LlmConversation,
+    *,
+    account_id: str,
+    knowledge_base_id: str,
+    document_id: str = "",
+    context_mode: str = "",
+) -> bool:
+    if conversation.account_id != account_id or conversation.knowledge_base_id != knowledge_base_id:
+        return False
+    if context_mode and conversation.context_mode != context_mode:
+        return False
+    if document_id:
+        return document_id in {
+            str(document.get("document_id") or "").strip()
+            for document in conversation.context_documents
+            if isinstance(document, dict)
+        }
+    return True
+
+
+def _parse_llm_context_document_ids(payload: dict[str, Any], *, max_documents: int) -> list[str]:
+    raw_documents = payload.get("context_documents")
+    if raw_documents is None:
+        raw_documents = payload.get("context_document_ids")
+    if raw_documents is None:
+        return []
+    if not isinstance(raw_documents, list):
+        raise HTTPException(status_code=400, detail="context_documents must be an array")
+
+    document_ids: list[str] = []
+    for raw_document in raw_documents:
+        if isinstance(raw_document, dict):
+            document_id = str(raw_document.get("document_id") or "").strip()
+        else:
+            document_id = str(raw_document or "").strip()
+        if not document_id:
+            raise HTTPException(status_code=400, detail="context document_id is required")
+        if document_id in document_ids:
+            raise HTTPException(status_code=400, detail="context document_id must be unique")
+        document_ids.append(document_id)
+
+    if len(document_ids) > max_documents:
+        raise HTTPException(status_code=400, detail=f"context_documents supports at most {max_documents} documents")
+    return document_ids
+
+
+def _conversation_with_context_update(
+    conversation: LlmConversation,
+    payload: dict[str, Any],
+    *,
+    config: dict[str, Any],
+    document_store: ElasticsearchDocumentStore | None = None,
+) -> LlmConversation:
+    if "context_documents" not in payload and "context_document_ids" not in payload:
+        return conversation
+    if conversation.origin == "reader":
+        raise HTTPException(status_code=400, detail="Reader-origin conversation context cannot be modified")
+    conversation_config = _llm_conversation_config(config)
+    document_ids = _parse_llm_context_document_ids(payload, max_documents=conversation_config["max_context_documents"])
+    context_documents = _load_llm_context_document_snapshots(
+        document_store,
+        account_id=conversation.account_id,
+        knowledge_base_id=conversation.knowledge_base_id,
+        document_ids=document_ids,
+    )
+    conversation.context_documents = context_documents
+    conversation.context_mode = LLM_CONTEXT_MODE_DOCUMENTS if context_documents else LLM_CONTEXT_MODE_NONE
+    return conversation
+
+
+def _load_llm_context_document_snapshots(
+    document_store: Any,
+    *,
+    account_id: str,
+    knowledge_base_id: str,
+    document_ids: list[str],
+) -> list[dict[str, Any]]:
+    if not document_ids:
+        return []
+    if document_store is None or not callable(getattr(document_store, "get_document", None)):
+        raise HTTPException(status_code=503, detail="Document store is required for LLM document context")
+
+    snapshots: list[dict[str, Any]] = []
+    for index, document_id in enumerate(document_ids):
+        record = document_store.get_document(
+            account_id=account_id,
+            knowledge_base_id=knowledge_base_id,
+            document_id=document_id,
+        )
+        if record is None:
+            raise HTTPException(status_code=404, detail=f"Context document does not exist or is not accessible: {document_id}")
+        file_name = str(record.get("file_name") or record.get("title") or document_id)
+        snapshots.append(
+            {
+                "document_id": document_id,
+                "file_name": file_name,
+                "title": str(record.get("title") or file_name),
+                "account_id": str(record.get("account_id") or account_id),
+                "knowledge_base_id": str(record.get("knowledge_base_id") or knowledge_base_id),
+                "page_count": record.get("page_count"),
+                "ocr_engine": record.get("ocr_engine") or "",
+                "order": index,
+            }
+        )
+    return snapshots
+
+
+def _conversation_messages_for_llm(
+    conversation: LlmConversation,
+    user_content: str,
+    *,
+    config: dict[str, Any] | None = None,
+    document_store: Any = None,
+) -> list[dict[str, str]]:
     messages: list[dict[str, str]] = []
-    if conversation.system_prompt.strip():
-        messages.append({"role": "system", "content": conversation.system_prompt.strip()})
-    for message in conversation.messages:
+    conversation_config = _llm_conversation_config(config or {})
+    system_content = conversation.system_prompt.strip()
+    context_content = _llm_context_prompt(
+        conversation,
+        document_store=document_store,
+        max_chars=conversation_config["max_document_context_chars"],
+    )
+    if context_content:
+        system_content = "\n\n".join(
+            part
+            for part in [
+                system_content,
+                "Use the following knowledge base documents as context. When using document content, cite the document name and page number when possible.",
+                context_content,
+            ]
+            if part
+        )
+    if system_content:
+        messages.append({"role": "system", "content": system_content})
+
+    history = [
+        message
+        for message in conversation.messages
+        if message.role in {"user", "assistant"} and message.content.strip()
+    ]
+    max_history_messages = conversation_config["max_history_messages"]
+    if max_history_messages:
+        history = history[-max_history_messages:]
+    elif max_history_messages == 0:
+        history = []
+    for message in history:
         if message.role in {"user", "assistant"} and message.content.strip():
             messages.append({"role": message.role, "content": message.content.strip()})
     messages.append({"role": "user", "content": user_content.strip()})
     return messages
+
+
+def _llm_context_prompt(
+    conversation: LlmConversation,
+    *,
+    document_store: Any,
+    max_chars: int,
+) -> str:
+    if not conversation.context_documents:
+        return ""
+    if document_store is None or not callable(getattr(document_store, "load_ocr_document", None)):
+        raise HTTPException(status_code=503, detail="Document store is required for LLM document context")
+
+    blocks: list[str] = []
+    remaining = max(1, int(max_chars))
+    for index, snapshot in enumerate(conversation.context_documents, start=1):
+        document_id = str(snapshot.get("document_id") or "").strip()
+        if not document_id:
+            continue
+        document = document_store.load_ocr_document(
+            account_id=conversation.account_id,
+            knowledge_base_id=conversation.knowledge_base_id,
+            document_id=document_id,
+        )
+        if document is None:
+            raise HTTPException(status_code=404, detail=f"Context document OCR result is not ready: {document_id}")
+        file_name = str(snapshot.get("file_name") or document.source_file or document_id)
+        lines = [
+            f"[Document {index}]",
+            f"document_id: {document_id}",
+            f"file_name: {file_name}",
+            "",
+        ]
+        for page in document.pages:
+            page_text = page.text.strip()
+            if not page_text:
+                continue
+            lines.extend([f"Page {page.page_number}:", page_text, ""])
+        block = "\n".join(lines).strip()
+        if not block:
+            continue
+        if len(block) > remaining:
+            block = block[:remaining].rstrip()
+        blocks.append(block)
+        remaining -= len(block)
+        if remaining <= 0:
+            break
+    return "\n\n".join(blocks)
 
 
 def _get_llm_conversation_or_404(
@@ -1191,8 +2499,17 @@ def _conversation_title(content: str, max_length: int = 32) -> str:
     return title if len(title) <= max_length else f"{title[:max_length].rstrip()}..."
 
 
+def _is_default_llm_title(title: Any) -> bool:
+    normalized = str(title or "").strip()
+    return normalized in {_default_llm_title(), "New chat", "新对话"}
+
+
 def _default_llm_title() -> str:
     return "New chat"
+
+
+def _sse_event(event: str, data: dict[str, Any]) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
 def _web_ocr_config(config: dict[str, Any], engine: str) -> dict[str, Any]:
@@ -1342,6 +2659,14 @@ def _safe_pdf_name(filename: str) -> str:
 def _scope_id(value: Any, fallback: str) -> str:
     normalized = str(value or "").strip()
     return normalized or fallback
+
+
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
 
 
 def _es_now() -> str:

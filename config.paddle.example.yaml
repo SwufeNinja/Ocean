@@ -61,5 +61,12 @@ llm:
   model: ${LLM_MODEL}
   temperature: 0
   max_tokens: 4096
+  token_limit_field: max_completion_tokens
   timeout_seconds: 120
   retry: 3
+  web_search:
+    enabled: false
+    type: web_search
+    max_keyword: 3
+    force_search: false
+    limit: 3

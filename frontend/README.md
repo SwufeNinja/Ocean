@@ -1,6 +1,6 @@
-# Ocean Frontend
+# OCR Assistant Frontend
 
-Standalone Vue 3 + Vite + TypeScript frontend for the Ocean OCR web workbench.
+Standalone Vue 3 + Vite + TypeScript frontend for the OCR Assistant web workbench.
 
 ## Development
 
