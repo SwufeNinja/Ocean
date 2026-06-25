@@ -331,60 +331,138 @@
 
       <section v-else-if="activeView === 'reader'" class="reader">
         <div v-if="markdown" class="reader-ready">
-          <div class="reader-layout" :class="{ 'is-llm-panel-closed': !isLlmPanelOpen }" :style="readerLayoutStyle">
-            <aside class="keyword-panel" aria-label="关键词搜索">
-              <div class="keyword-panel-head">
-                <h2>关键词段落提取</h2>
-                <span v-if="keywordResults.length" class="keyword-count">{{ keywordResults.length }} 条</span>
-              </div>
-              <div class="field">
-                <label class="field-label">关键词（换行或逗号分隔）</label>
-                <textarea v-model="keywordInput" class="keyword-box" placeholder="请输入关键词..."></textarea>
-              </div>
-              <div class="option-row">
-                <label class="mini-field">
-                  <span class="field-label">匹配模式</span>
-                  <select v-model="keywordMode">
-                    <option value="any">任意命中</option>
-                    <option value="all">全部命中</option>
-                  </select>
-                </label>
-                <label class="mini-field">
-                  <span class="field-label">提取粒度</span>
-                  <select v-model="keywordGranularity">
-                    <option value="paragraph">命中段落</option>
-                    <option value="page">命中页面</option>
-                  </select>
-                </label>
-                <label class="mini-field">
-                  <span class="field-label">前文段数</span>
-                  <input v-model.number="keywordContextBefore" type="number" min="0" max="5" :disabled="keywordGranularity === 'page'" />
-                </label>
-                <label class="mini-field">
-                  <span class="field-label">后文段数</span>
-                  <input v-model.number="keywordContextAfter" type="number" min="0" max="5" :disabled="keywordGranularity === 'page'" />
-                </label>
-              </div>
-              <div class="check-row">
-                <label><input v-model="keywordUseRegex" type="checkbox" /> 使用正则</label>
-                <label><input v-model="keywordCaseSensitive" type="checkbox" /> 区分大小写</label>
-                <label><input v-model="keywordNormalizeChinese" type="checkbox" /> 简繁转换匹配</label>
-                <label><input v-model="keywordDeduplicate" type="checkbox" /> 去重合并</label>
-              </div>
-              <div class="actions">
-                <button type="button" :disabled="isExtracting || activeJob?.state !== 'done'" @click="extractKeywordResults">
-                  {{ isExtracting ? "提取中..." : "提取关键词" }}
+          <div
+            class="reader-layout"
+            :class="{ 'is-left-panel-closed': !isLeftPanelOpen, 'is-llm-panel-closed': !isLlmPanelOpen }"
+            :style="readerLayoutStyle"
+          >
+            <aside v-if="isLeftPanelOpen" class="reader-left-panel" aria-label="阅读器左侧工具">
+              <div v-if="isKeywordPanelOpen && isCitePanelOpen" class="reader-left-tabs" role="tablist" aria-label="左侧工具">
+                <button
+                  class="reader-left-tab"
+                  :class="{ active: activeLeftPanelTab === 'keywords' }"
+                  type="button"
+                  role="tab"
+                  :aria-selected="activeLeftPanelTab === 'keywords'"
+                  @click="activeLeftPanelTab = 'keywords'"
+                >
+                  <Search :size="14" :stroke-width="activeLeftPanelTab === 'keywords' ? 2.6 : 2" aria-hidden="true" />
+                  <span>关键词</span>
+                </button>
+                <button
+                  class="reader-left-tab"
+                  :class="{ active: activeLeftPanelTab === 'cite' }"
+                  type="button"
+                  role="tab"
+                  :aria-selected="activeLeftPanelTab === 'cite'"
+                  @click="activeLeftPanelTab = 'cite'"
+                >
+                  <TextQuote :size="14" :stroke-width="activeLeftPanelTab === 'cite' ? 2.6 : 2" aria-hidden="true" />
+                  <span>CITE</span>
                 </button>
               </div>
-              <div class="extract-status">{{ keywordStatus }}</div>
+
+              <section v-if="activeLeftPanelTab === 'keywords' && isKeywordPanelOpen" class="keyword-panel" aria-label="关键词搜索">
+                <div class="keyword-panel-head">
+                  <h2>关键词段落提取</h2>
+                  <div class="keyword-panel-actions">
+                    <span v-if="keywordResults.length" class="keyword-count">{{ keywordResults.length }} 条</span>
+                    <button
+                      class="llm-icon-button"
+                      type="button"
+                      aria-label="关闭关键词提取"
+                      title="关闭关键词提取"
+                      @click="closeKeywordPanel"
+                    >
+                      <X :size="17" :stroke-width="2" aria-hidden="true" />
+                    </button>
+                  </div>
+                </div>
+                <div class="field">
+                  <label class="field-label">关键词（换行或逗号分隔）</label>
+                  <textarea v-model="keywordInput" class="keyword-box" placeholder="请输入关键词..."></textarea>
+                </div>
+                <div class="option-row">
+                  <label class="mini-field">
+                    <span class="field-label">匹配模式</span>
+                    <select v-model="keywordMode">
+                      <option value="any">任意命中</option>
+                      <option value="all">全部命中</option>
+                    </select>
+                  </label>
+                  <label class="mini-field">
+                    <span class="field-label">提取粒度</span>
+                    <select v-model="keywordGranularity">
+                      <option value="paragraph">命中段落</option>
+                      <option value="page">命中页面</option>
+                    </select>
+                  </label>
+                  <label class="mini-field">
+                    <span class="field-label">前文段数</span>
+                    <input v-model.number="keywordContextBefore" type="number" min="0" max="5" :disabled="keywordGranularity === 'page'" />
+                  </label>
+                  <label class="mini-field">
+                    <span class="field-label">后文段数</span>
+                    <input v-model.number="keywordContextAfter" type="number" min="0" max="5" :disabled="keywordGranularity === 'page'" />
+                  </label>
+                </div>
+                <div class="check-row">
+                  <label><input v-model="keywordUseRegex" type="checkbox" /> 使用正则</label>
+                  <label><input v-model="keywordCaseSensitive" type="checkbox" /> 区分大小写</label>
+                  <label><input v-model="keywordNormalizeChinese" type="checkbox" /> 简繁转换匹配</label>
+                  <label><input v-model="keywordDeduplicate" type="checkbox" /> 去重合并</label>
+                </div>
+                <div class="actions">
+                  <button type="button" :disabled="isExtracting || activeJob?.state !== 'done'" @click="extractKeywordResults">
+                    {{ isExtracting ? "提取中..." : "提取关键词" }}
+                  </button>
+                </div>
+                <div class="extract-status">{{ keywordStatus }}</div>
+              </section>
+
+              <section v-if="activeLeftPanelTab === 'cite' && isCitePanelOpen" class="cite-panel" aria-label="CITE 引用">
+                <div class="keyword-panel-head">
+                  <h2>CITE</h2>
+                  <div class="keyword-panel-actions">
+                    <span class="keyword-count">第 {{ currentCitePageLabel }} 页</span>
+                    <button
+                      class="llm-icon-button"
+                      type="button"
+                      aria-label="关闭 CITE"
+                      title="关闭 CITE"
+                      @click="closeCitePanel"
+                    >
+                      <X :size="17" :stroke-width="2" aria-hidden="true" />
+                    </button>
+                  </div>
+                </div>
+                <div class="field cite-output-field">
+                  <label class="field-label">引用文本</label>
+                  <textarea
+                    v-model="citeOutput"
+                    class="cite-box cite-output"
+                    readonly
+                    placeholder="打开 CITE 后，在阅读器中选中文本即可生成引用。"
+                  ></textarea>
+                </div>
+                <div class="field cite-template-field">
+                  <label class="field-label">设置 cite_text，使用 {page} 插入当前页码</label>
+                  <textarea
+                    v-model="citeText"
+                    class="cite-box cite-template"
+                    placeholder="例如：引自本文第 {page} 页"
+                  ></textarea>
+                </div>
+              </section>
             </aside>
 
             <div
+              v-if="isLeftPanelOpen"
               class="reader-resizer"
               :class="{ active: activeReaderResizeTarget === 'left' }"
               role="separator"
               aria-orientation="vertical"
-              aria-label="Resize keyword panel"
+              aria-label="Resize left tools panel"
               :aria-valuemin="minReaderLeftWidth"
               :aria-valuemax="maxReaderLeftWidth"
               :aria-valuenow="readerLeftWidth"
@@ -392,7 +470,13 @@
             ></div>
 
             <div class="reader-content">
-              <div ref="readingFrame" class="reading-frame" :class="{ 'has-reader-inline-action': isKeywordResultView }" :style="readerZoomStyle">
+              <div
+                ref="readingFrame"
+                class="reading-frame"
+                :class="{ 'has-reader-inline-action': isKeywordResultView }"
+                :style="readerZoomStyle"
+                @mouseup="captureCiteSelection"
+              >
                 <div v-if="isReaderMenuOpen" class="reader-menu-scrim" aria-hidden="true" @click="closeReaderMenu"></div>
                 <div class="reader-menu" @click.stop>
                   <button
@@ -405,14 +489,34 @@
                     <MoreHorizontal :size="20" :stroke-width="2" aria-hidden="true" />
                   </button>
                   <button
-                    v-if="!isLlmPanelOpen"
-                    class="reader-llm-restore-button"
+                    class="reader-panel-toggle-button"
+                    :class="{ active: isKeywordPanelOpen }"
                     type="button"
-                    aria-label="打开文档对话"
-                    title="打开文档对话"
-                    @click="openLlmPanel"
+                    :aria-label="isKeywordPanelOpen ? '关闭关键词提取' : '打开关键词提取'"
+                    :title="isKeywordPanelOpen ? '关闭关键词提取' : '打开关键词提取'"
+                    @click="toggleKeywordPanel"
                   >
-                    <Bot :size="19" :stroke-width="2" aria-hidden="true" />
+                    <Search :size="19" :stroke-width="isKeywordPanelOpen ? 2.8 : 2" aria-hidden="true" />
+                  </button>
+                  <button
+                    class="reader-panel-toggle-button"
+                    :class="{ active: isCitePanelOpen }"
+                    type="button"
+                    :aria-label="isCitePanelOpen ? '关闭 CITE' : '打开 CITE'"
+                    :title="isCitePanelOpen ? '关闭 CITE' : '打开 CITE'"
+                    @click="toggleCitePanel"
+                  >
+                    <TextQuote :size="19" :stroke-width="isCitePanelOpen ? 2.8 : 2" aria-hidden="true" />
+                  </button>
+                  <button
+                    class="reader-panel-toggle-button"
+                    :class="{ active: isLlmPanelOpen }"
+                    type="button"
+                    :aria-label="isLlmPanelOpen ? '关闭文档对话' : '打开文档对话'"
+                    :title="isLlmPanelOpen ? '关闭文档对话' : '打开文档对话'"
+                    @click="toggleLlmPanel"
+                  >
+                    <Bot :size="19" :stroke-width="isLlmPanelOpen ? 2.8 : 2" aria-hidden="true" />
                   </button>
                   <div v-if="isReaderMenuOpen" class="reader-menu-panel">
                     <div class="reader-menu-section">
@@ -615,10 +719,12 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import type { Component, CSSProperties } from "vue";
-import { BookOpen, Bot, Database, FileText, Globe, LogOut, MoreHorizontal, PanelLeftClose, PanelLeftOpen, Plus, RefreshCw, Search, Send, Settings, Upload, X } from "@lucide/vue";
+import { BookOpen, Bot, Database, FileText, Globe, LogOut, MoreHorizontal, PanelLeftClose, PanelLeftOpen, Plus, RefreshCw, Search, Send, Settings, TextQuote, Upload, X } from "@lucide/vue";
 import DOMPurify from "dompurify";
 import { marked } from "marked";
 import {
+  authUnauthorizedEvent,
+  clearAuthToken,
   createJobs,
   downloadTextFile,
   extractDocumentKeywords,
@@ -682,6 +788,10 @@ interface PersistedReaderState {
   zoom?: number;
   leftWidth?: number;
   rightWidth?: number;
+  keywordPanelOpen?: boolean;
+  citePanelOpen?: boolean;
+  activeLeftPanelTab?: LeftPanelTab;
+  citeText?: string;
   llmPanelOpen?: boolean;
 }
 
@@ -697,6 +807,7 @@ type ActiveView = "upload" | "library" | "chat" | "reader";
 type ReaderResizeTarget = "left" | "right";
 type AuthStatus = "checking" | "login" | "ready";
 type LlmPanelMode = "chat" | "history";
+type LeftPanelTab = "keywords" | "cite";
 
 interface ViewItem {
   value: ActiveView;
@@ -748,6 +859,9 @@ const showRaw = ref(false);
 const isReaderMenuOpen = ref(false);
 const isSettingsOpen = ref(false);
 const isKeywordResultView = ref(false);
+const isKeywordPanelOpen = ref(true);
+const isCitePanelOpen = ref(false);
+const activeLeftPanelTab = ref<LeftPanelTab>("keywords");
 const isLlmPanelOpen = ref(true);
 const readerZoom = ref(100);
 const zoomInput = ref(100);
@@ -783,6 +897,8 @@ const keywordContextAfter = ref(1);
 const keywordResults = ref<KeywordResult[]>([]);
 const keywordStatus = ref("OCR 完成后可以在这里提取关键词段落。");
 const isExtracting = ref(false);
+const citeText = ref("引自本文第 {page} 页");
+const citeOutput = ref("");
 
 const llmStatus = ref<LlmStatusResponse | null>(null);
 const llmWebSearchEnabled = ref(false);
@@ -908,6 +1024,8 @@ const llmStatusLabel = computed(() => {
   if (!llmStatus.value.configured) return "LLM 未配置";
   return llmStatus.value.model ? `LLM 已连接 · ${llmStatus.value.model}` : "LLM 已连接";
 });
+const isLeftPanelOpen = computed(() => isKeywordPanelOpen.value || isCitePanelOpen.value);
+const currentCitePageLabel = computed(() => String(currentCitePageNumber()));
 const currentReaderDocumentId = computed(() => activeJob.value?.document_id || activeLibraryDocumentId.value || "");
 const canSendLlmMessage = computed(() =>
   Boolean(markdown.value && llmInput.value.trim() && !isLlmPreparing.value && !isLlmSending.value)
@@ -918,18 +1036,24 @@ const canSendGlobalLlmMessage = computed(() =>
 
 onMounted(() => {
   document.addEventListener("pointerdown", onDocumentPointerDown);
+  window.addEventListener(authUnauthorizedEvent, onAuthUnauthorized);
   void initializeApp();
 });
 
-watch([currentPage, readerZoom, readerLeftWidth, readerRightWidth, isLlmPanelOpen], () => {
+watch([currentPage, readerZoom, readerLeftWidth, readerRightWidth, isKeywordPanelOpen, isCitePanelOpen, activeLeftPanelTab, citeText, isLlmPanelOpen], () => {
   persistCurrentReaderState();
 });
 
 onBeforeUnmount(() => {
   document.removeEventListener("pointerdown", onDocumentPointerDown);
+  window.removeEventListener(authUnauthorizedEvent, onAuthUnauthorized);
   clearPollTimer();
   stopReaderResize();
 });
+
+function onAuthUnauthorized() {
+  handleAuthExpired();
+}
 
 function onDocumentPointerDown(event: PointerEvent) {
   if (!isGlobalContextPickerOpen.value) return;
@@ -953,6 +1077,70 @@ function closeSettings() {
   isSettingsOpen.value = false;
 }
 
+function currentScope() {
+  const scopedAccountId = authEnabled.value ? currentUser.value?.account_id || "local" : accountId.value || "local";
+  return {
+    accountId: scopedAccountId,
+    knowledgeBaseId: knowledgeBaseId.value || "default"
+  };
+}
+
+function resetSessionState() {
+  closeSettings();
+  clearPollTimer();
+  clearPersistedUploadJobs();
+  clearPersistedReaderState();
+  currentUser.value = null;
+  selectedFiles.value = [];
+  activeJobs.value = [];
+  activeJobId.value = null;
+  accountId.value = "local";
+  knowledgeBaseId.value = "default";
+  activeLibraryDocumentId.value = null;
+  libraryDocuments.value = [];
+  libraryQuery.value = "";
+  isLibraryLoading.value = false;
+  activeView.value = "upload";
+  isBusy.value = false;
+  progress.value = 0;
+  statusText.value = "等待上传";
+  logs.value = [];
+  readerTitle.value = "Markdown 阅读器";
+  downloadUrl.value = "";
+  keywordInput.value = "";
+  keywordResults.value = [];
+  keywordStatus.value = "OCR 完成后可以在这里提取关键词段落。";
+  isExtracting.value = false;
+  llmStatus.value = null;
+  llmWebSearchEnabled.value = false;
+  isLlmPreparing.value = false;
+  isLlmSending.value = false;
+  isLlmHistoryLoading.value = false;
+  resetReader();
+  globalLlmConversation.value = null;
+  globalLlmConversations.value = [];
+  selectedGlobalContextDocumentIds.value = [];
+  globalContextQuery.value = "";
+  globalLlmInput.value = "";
+  globalLlmError.value = "";
+  isGlobalLlmPreparing.value = false;
+  isGlobalLlmSending.value = false;
+  isGlobalLlmHistoryLoading.value = false;
+}
+
+function enterLoginState(message = "") {
+  resetSessionState();
+  authEnabled.value = true;
+  authStatus.value = "login";
+  loginPassword.value = "";
+  loginError.value = message;
+}
+
+function handleAuthExpired() {
+  clearAuthToken();
+  enterLoginState("登录已过期，请重新登录。");
+}
+
 async function initializeApp() {
   authStatus.value = "checking";
   try {
@@ -962,6 +1150,10 @@ async function initializeApp() {
     authStatus.value = "ready";
     await loadInitialData();
   } catch (error) {
+    if (isUnauthorizedError(error)) {
+      enterLoginState("");
+      return;
+    }
     authEnabled.value = true;
     currentUser.value = null;
     loginError.value = "";
@@ -972,12 +1164,15 @@ async function initializeApp() {
 async function loadInitialData() {
   const initialView = readActiveViewFromUrl();
   await Promise.all([loadEngineOptions(), loadLibraryDocuments(), loadLlmStatus(), loadGlobalLlmConversations()]);
+  if (authStatus.value !== "ready") return;
   if (initialView && initialView !== "reader") {
     activeView.value = initialView;
   } else {
     await restoreReaderFromPersistedState();
   }
+  if (authStatus.value !== "ready") return;
   await restoreActiveUploadJobs();
+  if (authStatus.value !== "ready") return;
   if (!window.location.hash) writeActiveViewToUrl(activeView.value);
 }
 
@@ -1005,22 +1200,23 @@ async function submitLogin() {
 }
 
 async function handleLogout() {
-  closeSettings();
-  await apiLogout();
-  currentUser.value = null;
-  activeJobs.value = [];
-  activeJobId.value = null;
-  activeLibraryDocumentId.value = null;
-  libraryDocuments.value = [];
-  clearPersistedUploadJobs();
-  clearPollTimer();
-  resetReader();
-  loginPassword.value = "";
-  authStatus.value = "login";
+  try {
+    await apiLogout();
+  } finally {
+    clearAuthToken();
+    enterLoginState("");
+  }
 }
 
 async function restoreReaderFromPersistedState() {
-  const state = readReaderStateFromUrl() || readReaderStateFromStorage();
+  const storedState = readReaderStateFromStorage();
+  const urlState = readReaderStateFromUrl();
+  const state = urlState
+    ? {
+        ...urlState,
+        citeText: storedState?.citeText ?? urlState.citeText
+      }
+    : storedState;
   if (!state) return;
   applyReaderUiState(state);
   try {
@@ -1032,16 +1228,43 @@ async function restoreReaderFromPersistedState() {
       await restoreJobReader(state);
     }
   } catch (error) {
+    if (handleUnauthorizedError(error)) return;
     console.warn("Failed to restore reader state", error);
     libraryStatus.value = `恢复上次文档失败：${getErrorMessage(error)}`;
   }
 }
 
 async function restoreDocumentReader(state: PersistedReaderState) {
-  const scopedAccountId = state.accountId || accountId.value;
-  const scopedKnowledgeBaseId = state.knowledgeBaseId || knowledgeBaseId.value;
-  accountId.value = scopedAccountId;
-  knowledgeBaseId.value = scopedKnowledgeBaseId;
+  const previous = {
+    accountId: accountId.value,
+    knowledgeBaseId: knowledgeBaseId.value,
+    activeJobs: activeJobs.value,
+    activeJobId: activeJobId.value,
+    activeLibraryDocumentId: activeLibraryDocumentId.value,
+    keywordResults: keywordResults.value,
+    keywordStatus: keywordStatus.value,
+    markdown: markdown.value,
+    displayMarkdown: displayMarkdown.value,
+    originalReaderState: originalReaderState.value,
+    readerTitle: readerTitle.value,
+    downloadUrl: downloadUrl.value,
+    showRaw: showRaw.value,
+    isKeywordResultView: isKeywordResultView.value,
+    pageItems: pageItems.value,
+    currentPage: currentPage.value,
+    pageInput: pageInput.value,
+    llmConversation: llmConversation.value,
+    llmPanelMode: llmPanelMode.value,
+    documentLlmConversations: documentLlmConversations.value,
+    llmInput: llmInput.value,
+    llmError: llmError.value,
+    activeView: activeView.value
+  };
+  const baseScope = currentScope();
+  const scopedAccountId = authEnabled.value
+    ? currentUser.value?.account_id || baseScope.accountId
+    : state.accountId || baseScope.accountId;
+  const scopedKnowledgeBaseId = state.knowledgeBaseId || baseScope.knowledgeBaseId;
   const query = new URLSearchParams({
     account_id: scopedAccountId,
     knowledge_base_id: scopedKnowledgeBaseId
@@ -1060,24 +1283,58 @@ async function restoreDocumentReader(state: PersistedReaderState) {
     progress: 100,
     message: "来自知识库",
     total_pages: state.totalPages ?? null,
-    markdown_url: state.markdownUrl || `/api/documents/${encodeURIComponent(documentId)}/markdown?${query}`,
-    download_url: state.downloadUrl || `/api/documents/${encodeURIComponent(documentId)}/download?${query}`,
-    pages_url: state.pagesUrl || `/api/documents/${encodeURIComponent(documentId)}/pages?${query}`,
+    markdown_url: `/api/documents/${encodeURIComponent(documentId)}/markdown?${query}`,
+    download_url: `/api/documents/${encodeURIComponent(documentId)}/download?${query}`,
+    pages_url: `/api/documents/${encodeURIComponent(documentId)}/pages?${query}`,
     created_at: "",
     updated_at: ""
   };
-  activeJobs.value = mergeJobsById([job, ...activeJobs.value.filter((item) => !isLibraryJob(item))]);
-  activeJobId.value = job.job_id;
-  activeLibraryDocumentId.value = documentId;
-  keywordResults.value = [];
-  keywordStatus.value = "OCR 完成后可以在这里提取关键词段落。";
-  await loadJobResult(job, { openReader: true, page: state.page, skipPersist: true });
-  persistCurrentReaderState();
+  try {
+    activeJobs.value = mergeJobsById([job, ...activeJobs.value.filter((item) => !isLibraryJob(item))]);
+    activeJobId.value = job.job_id;
+    activeLibraryDocumentId.value = documentId;
+    keywordResults.value = [];
+    keywordStatus.value = "OCR 完成后可以在这里提取关键词段落。";
+    await loadJobResult(job, { openReader: true, page: state.page, skipPersist: true });
+    accountId.value = scopedAccountId;
+    knowledgeBaseId.value = scopedKnowledgeBaseId;
+    persistCurrentReaderState();
+  } catch (error) {
+    if (isUnauthorizedError(error)) throw error;
+    accountId.value = previous.accountId;
+    knowledgeBaseId.value = previous.knowledgeBaseId;
+    activeJobs.value = previous.activeJobs;
+    activeJobId.value = previous.activeJobId;
+    activeLibraryDocumentId.value = previous.activeLibraryDocumentId;
+    keywordResults.value = previous.keywordResults;
+    keywordStatus.value = previous.keywordStatus;
+    markdown.value = previous.markdown;
+    displayMarkdown.value = previous.displayMarkdown;
+    originalReaderState.value = previous.originalReaderState;
+    readerTitle.value = previous.readerTitle;
+    downloadUrl.value = previous.downloadUrl;
+    showRaw.value = previous.showRaw;
+    isKeywordResultView.value = previous.isKeywordResultView;
+    pageItems.value = previous.pageItems;
+    currentPage.value = previous.currentPage;
+    pageInput.value = previous.pageInput;
+    llmConversation.value = previous.llmConversation;
+    llmPanelMode.value = previous.llmPanelMode;
+    documentLlmConversations.value = previous.documentLlmConversations;
+    llmInput.value = previous.llmInput;
+    llmError.value = previous.llmError;
+    activeView.value = previous.activeView;
+    throw error;
+  }
 }
 
 async function restoreJobReader(state: PersistedReaderState) {
   if (!state.jobId) return;
-  const job = await getJob(state.jobId);
+  const scope = currentScope();
+  const job = await getJob(state.jobId, {
+    accountId: authEnabled.value ? scope.accountId : state.accountId || scope.accountId,
+    knowledgeBaseId: state.knowledgeBaseId || scope.knowledgeBaseId
+  });
   activeJobs.value = mergeJobsById([job, ...activeJobs.value.filter((existing) => !isLibraryJob(existing))]);
   activeJobId.value = job.job_id;
   activeLibraryDocumentId.value = null;
@@ -1089,7 +1346,12 @@ function applyReaderUiState(state: PersistedReaderState) {
   if (state.zoom) setZoom(state.zoom);
   if (state.leftWidth) readerLeftWidth.value = clampReaderPanelWidth(state.leftWidth, minReaderLeftWidth, maxReaderLeftWidth);
   if (state.rightWidth) readerRightWidth.value = clampReaderPanelWidth(state.rightWidth, minReaderRightWidth, maxReaderRightWidth);
+  if (typeof state.keywordPanelOpen === "boolean") isKeywordPanelOpen.value = state.keywordPanelOpen;
+  if (typeof state.citePanelOpen === "boolean") isCitePanelOpen.value = state.citePanelOpen;
+  if (state.activeLeftPanelTab === "keywords" || state.activeLeftPanelTab === "cite") activeLeftPanelTab.value = state.activeLeftPanelTab;
+  if (typeof state.citeText === "string") citeText.value = state.citeText;
   if (typeof state.llmPanelOpen === "boolean") isLlmPanelOpen.value = state.llmPanelOpen;
+  ensureVisibleLeftPanelTab();
 }
 
 function persistCurrentReaderState() {
@@ -1120,6 +1382,10 @@ function currentReaderState(): PersistedReaderState | null {
     zoom: readerZoom.value,
     leftWidth: readerLeftWidth.value,
     rightWidth: readerRightWidth.value,
+    keywordPanelOpen: isKeywordPanelOpen.value,
+    citePanelOpen: isCitePanelOpen.value,
+    activeLeftPanelTab: activeLeftPanelTab.value,
+    citeText: citeText.value,
     llmPanelOpen: isLlmPanelOpen.value
   };
   if (isLibraryJob(job) && job.document_id) {
@@ -1155,6 +1421,9 @@ function readReaderStateFromUrl(): PersistedReaderState | null {
     zoom: numberParam(params, "zoom"),
     leftWidth: numberParam(params, "left_width"),
     rightWidth: numberParam(params, "right_width"),
+    keywordPanelOpen: boolParam(params, "keyword_panel"),
+    citePanelOpen: boolParam(params, "cite_panel"),
+    activeLeftPanelTab: leftPanelTabParam(params, "left_tab"),
     llmPanelOpen: boolParam(params, "llm_panel")
   };
 }
@@ -1191,6 +1460,9 @@ function writeReaderStateToUrl(state: PersistedReaderState) {
   params.set("zoom", String(state.zoom || 100));
   params.set("left_width", String(state.leftWidth || readerLeftWidth.value));
   params.set("right_width", String(state.rightWidth || readerRightWidth.value));
+  params.set("keyword_panel", state.keywordPanelOpen === false ? "0" : "1");
+  params.set("cite_panel", state.citePanelOpen === true ? "1" : "0");
+  params.set("left_tab", state.activeLeftPanelTab || activeLeftPanelTab.value);
   params.set("llm_panel", state.llmPanelOpen === false ? "0" : "1");
   window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}#/reader?${params.toString()}`);
 }
@@ -1246,8 +1518,12 @@ async function loadPersistedUploadJobs(state: PersistedUploadJobsState | null): 
   const results = await Promise.all(
     state.jobIds.map(async (jobId) => {
       try {
-        return await getJob(jobId);
-      } catch {
+        return await getJob(jobId, {
+          accountId: state.accountId || accountId.value,
+          knowledgeBaseId: state.knowledgeBaseId || knowledgeBaseId.value
+        });
+      } catch (error) {
+        if (isUnauthorizedError(error)) throw error;
         return null;
       }
     })
@@ -1265,6 +1541,7 @@ async function loadServerActiveJobs(): Promise<WebJob[]> {
     });
     return data.jobs || [];
   } catch (error) {
+    if (handleUnauthorizedError(error)) throw error;
     console.warn("Failed to restore active OCR jobs", error);
     return [];
   }
@@ -1348,6 +1625,11 @@ function boolParam(params: URLSearchParams, key: string): boolean | undefined {
   return undefined;
 }
 
+function leftPanelTabParam(params: URLSearchParams, key: string): LeftPanelTab | undefined {
+  const value = params.get(key);
+  return value === "keywords" || value === "cite" ? value : undefined;
+}
+
 function resetReader() {
   markdown.value = "";
   displayMarkdown.value = "";
@@ -1361,6 +1643,7 @@ function resetReader() {
   documentLlmConversations.value = [];
   llmInput.value = "";
   llmError.value = "";
+  citeOutput.value = "";
   clearPersistedReaderState();
 }
 
@@ -1434,6 +1717,98 @@ function closeLlmPanel() {
   isLlmPanelOpen.value = false;
   closeReaderMenu();
   if (activeReaderResizeTarget.value === "right") stopReaderResize();
+}
+
+function toggleLlmPanel() {
+  if (isLlmPanelOpen.value) {
+    closeLlmPanel();
+    return;
+  }
+  openLlmPanel();
+}
+
+function openKeywordPanel() {
+  isKeywordPanelOpen.value = true;
+  activeLeftPanelTab.value = "keywords";
+}
+
+function closeKeywordPanel() {
+  isKeywordPanelOpen.value = false;
+  closeReaderMenu();
+  if (activeReaderResizeTarget.value === "left") stopReaderResize();
+  ensureVisibleLeftPanelTab();
+}
+
+function toggleKeywordPanel() {
+  if (isKeywordPanelOpen.value && activeLeftPanelTab.value === "keywords") {
+    closeKeywordPanel();
+    return;
+  }
+  openKeywordPanel();
+}
+
+function openCitePanel() {
+  isCitePanelOpen.value = true;
+  activeLeftPanelTab.value = "cite";
+}
+
+function closeCitePanel() {
+  isCitePanelOpen.value = false;
+  closeReaderMenu();
+  ensureVisibleLeftPanelTab();
+}
+
+function toggleCitePanel() {
+  if (isCitePanelOpen.value && activeLeftPanelTab.value === "cite") {
+    closeCitePanel();
+    return;
+  }
+  openCitePanel();
+}
+
+function captureCiteSelection(event: MouseEvent) {
+  if (event.button !== 0 || !isCitePanelOpen.value || activeLeftPanelTab.value !== "cite") return;
+  const selectedText = selectedReaderText();
+  if (!selectedText) return;
+  const citation = formatCiteText(currentCitePageNumber());
+  citeOutput.value = citation ? `${selectedText}\n\n\n${citation}` : selectedText;
+}
+
+function selectedReaderText() {
+  const root = readingFrame.value;
+  const selection = window.getSelection();
+  if (!root || !selection || selection.isCollapsed || selection.rangeCount < 1) return "";
+  const markdownRoot = root.querySelector(".markdown");
+  if (!markdownRoot) return "";
+  const range = selection.getRangeAt(0);
+  if (!markdownRoot.contains(range.commonAncestorContainer)) return "";
+  return selection
+    .toString()
+    .replace(/\r\n/g, "\n")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function formatCiteText(page: number) {
+  return citeText.value.replace(/\{page\}/g, String(page)).trim();
+}
+
+function currentCitePageNumber() {
+  const item = currentPageItem.value;
+  return item?.sourcePageNumber || item?.pageNumber || currentPage.value || 1;
+}
+
+function ensureVisibleLeftPanelTab() {
+  if (activeLeftPanelTab.value === "keywords" && !isKeywordPanelOpen.value && isCitePanelOpen.value) {
+    activeLeftPanelTab.value = "cite";
+    return;
+  }
+  if (activeLeftPanelTab.value === "cite" && !isCitePanelOpen.value && isKeywordPanelOpen.value) {
+    activeLeftPanelTab.value = "keywords";
+    return;
+  }
+  if (!isKeywordPanelOpen.value && !isCitePanelOpen.value) activeLeftPanelTab.value = "keywords";
 }
 
 function toggleRawFromReaderMenu() {
@@ -1511,6 +1886,7 @@ async function loadLlmStatus() {
     didInitializeLlmWebSearchToggle = true;
     llmError.value = llmStatus.value.configured ? "" : "请先在后端配置 LLM_API_BASE_URL、LLM_API_KEY 和 LLM_MODEL。";
   } catch (error) {
+    if (handleUnauthorizedError(error)) return;
     llmStatus.value = null;
     llmWebSearchEnabled.value = false;
     llmError.value = `LLM 状态检查失败：${getErrorMessage(error)}`;
@@ -1535,6 +1911,7 @@ async function startLlmConversationForCurrentDocument(initialTitle = "") {
     void loadDocumentLlmConversations();
     await scrollLlmMessagesToBottom();
   } catch (error) {
+    if (handleUnauthorizedError(error)) return;
     llmConversation.value = null;
     llmError.value = `创建对话失败：${getErrorMessage(error)}`;
   } finally {
@@ -1590,6 +1967,7 @@ async function sendCurrentLlmMessage() {
     upsertDocumentLlmConversation(mergedConversation);
     await scrollLlmMessagesToBottom();
   } catch (error) {
+    if (handleUnauthorizedError(error)) return;
     markLocalLlmMessage(localUserMessage.message_id, { pending: false, error: true });
     markLocalLlmMessage(localAssistantMessage.message_id, { pending: false, error: true });
     llmInput.value = content;
@@ -1622,6 +2000,7 @@ async function loadDocumentLlmConversations() {
     });
     documentLlmConversations.value = (data.conversations || []).filter(hasConversationMessages);
   } catch (error) {
+    if (handleUnauthorizedError(error)) return;
     llmError.value = `加载对话记录失败：${getErrorMessage(error)}`;
   } finally {
     isLlmHistoryLoading.value = false;
@@ -1635,6 +2014,7 @@ async function openDocumentLlmConversation(conversationId: string) {
     llmPanelMode.value = "chat";
     await scrollLlmMessagesToBottom();
   } catch (error) {
+    if (handleUnauthorizedError(error)) return;
     llmError.value = `打开对话失败：${getErrorMessage(error)}`;
   }
 }
@@ -1649,6 +2029,7 @@ async function loadGlobalLlmConversations() {
     });
     globalLlmConversations.value = (data.conversations || []).filter(hasConversationMessages);
   } catch (error) {
+    if (handleUnauthorizedError(error)) return;
     globalLlmError.value = `加载对话记录失败：${getErrorMessage(error)}`;
   } finally {
     isGlobalLlmHistoryLoading.value = false;
@@ -1696,6 +2077,7 @@ async function openGlobalLlmConversation(conversationId: string) {
     isGlobalContextPickerOpen.value = false;
     await scrollGlobalLlmMessagesToBottom();
   } catch (error) {
+    if (handleUnauthorizedError(error)) return;
     globalLlmError.value = `打开对话失败：${getErrorMessage(error)}`;
   }
 }
@@ -1715,6 +2097,7 @@ async function ensureGlobalLlmConversation(firstMessage = "") {
     });
     return true;
   } catch (error) {
+    if (handleUnauthorizedError(error)) return false;
     globalLlmConversation.value = null;
     globalLlmError.value = `创建对话失败：${getErrorMessage(error)}`;
     return false;
@@ -1761,6 +2144,7 @@ async function sendGlobalLlmMessage() {
     upsertGlobalLlmConversation(mergedConversation);
     await scrollGlobalLlmMessagesToBottom();
   } catch (error) {
+    if (handleUnauthorizedError(error)) return;
     globalLlmConversation.value = {
       ...globalLlmConversation.value,
       messages: (globalLlmConversation.value.messages || []).map((message) =>
@@ -1924,6 +2308,7 @@ async function loadLibraryDocuments() {
         ? "没有匹配的文件"
         : "暂无文件";
   } catch (error) {
+    if (handleUnauthorizedError(error)) return;
     libraryDocuments.value = [];
     libraryStatus.value = `加载失败：${getErrorMessage(error)}`;
   } finally {
@@ -1957,7 +2342,12 @@ async function openLibraryDocument(item: KnowledgeDocument) {
   activeJobId.value = job.job_id;
   keywordResults.value = [];
   keywordStatus.value = "OCR 完成后可以在这里提取关键词段落。";
-  await loadJobResult(job, { openReader: true });
+  try {
+    await loadJobResult(job, { openReader: true });
+  } catch (error) {
+    if (handleUnauthorizedError(error)) return;
+    logs.value = [getErrorMessage(error)];
+  }
 }
 
 function libraryDocumentMeta(item: KnowledgeDocument) {
@@ -2065,7 +2455,12 @@ async function startUpload() {
   keywordStatus.value = "OCR 完成后可以在这里提取关键词段落。";
 
   try {
-    const batch = await createJobs(selectedFiles.value, engine.value, (percent) => setProgress(percent, "正在上传 PDF"));
+    const scope = currentScope();
+    const batch = await createJobs(selectedFiles.value, engine.value, {
+      accountId: scope.accountId,
+      knowledgeBaseId: scope.knowledgeBaseId,
+      onUploadProgress: (percent) => setProgress(percent, "正在上传 PDF")
+    });
     activeJobs.value = batch.jobs || [];
     activeJobId.value = activeJobs.value[0]?.job_id || null;
     persistActiveUploadJobs();
@@ -2073,6 +2468,7 @@ async function startUpload() {
     if (batch.skipped) logs.value = [`已忽略 ${batch.skipped} 个非 PDF 文件`];
     void pollJobs();
   } catch (error) {
+    if (handleUnauthorizedError(error)) return;
     failUpload(getErrorMessage(error));
   }
 }
@@ -2095,7 +2491,13 @@ async function pollJobs() {
     const refreshedResults = await Promise.all(
       uploadJobs.map(async (item) => {
         try {
-          return { job: await getJob(item.job_id), missing: false };
+          return {
+            job: await getJob(item.job_id, {
+              accountId: item.account_id || accountId.value,
+              knowledgeBaseId: item.knowledge_base_id || knowledgeBaseId.value
+            }),
+            missing: false
+          };
         } catch (error) {
           if (isMissingJobError(error)) return { job: item, missing: true };
           throw error;
@@ -2143,7 +2545,8 @@ async function pollJobs() {
     if (finished === polledJobs.length) {
       const selectedDone = activeJob.value?.state === "done" && !isLibraryJob(activeJob.value) ? activeJob.value : null;
       const firstDone = polledJobs.find((item) => item.state === "done");
-      if (!markdown.value && (selectedDone || firstDone)) await loadJobResult(selectedDone || firstDone);
+      const doneJob = selectedDone || firstDone;
+      if (!markdown.value && doneJob) await loadJobResult(doneJob);
       void loadLibraryDocuments();
       isBusy.value = false;
       clearPersistedUploadJobs();
@@ -2152,6 +2555,7 @@ async function pollJobs() {
 
     pollTimer = window.setTimeout(() => void pollJobs(), 2000);
   } catch (error) {
+    if (handleUnauthorizedError(error)) return;
     statusText.value = `轮询失败：${getErrorMessage(error)}`;
     pollTimer = window.setTimeout(() => void pollJobs(), 4000);
   }
@@ -2164,7 +2568,12 @@ async function selectJob(job: WebJob, options: { openReader?: boolean } = {}) {
   keywordResults.value = [];
   keywordStatus.value = "OCR 完成后可以在这里提取关键词段落。";
   if (job.state === "done" && job.markdown_url) {
-    await loadJobResult(job, { openReader: options.openReader ?? true });
+    try {
+      await loadJobResult(job, { openReader: options.openReader ?? true });
+    } catch (error) {
+      if (handleUnauthorizedError(error)) return;
+      logs.value = [getErrorMessage(error)];
+    }
     return;
   }
   resetReader();
@@ -2192,6 +2601,7 @@ async function downloadCurrentMarkdown() {
   try {
     await downloadTextFile(downloadUrl.value, `${stem}.md`);
   } catch (error) {
+    if (handleUnauthorizedError(error)) return;
     logs.value = [getErrorMessage(error)];
   }
 }
@@ -2201,11 +2611,13 @@ async function loadMarkdown(url: string, pagesUrl?: string | null, options: { op
   displayMarkdown.value = stripPageHeadings(markdown.value);
   originalReaderState.value = null;
   isKeywordResultView.value = false;
+  citeOutput.value = "";
   pageItems.value = [];
   if (pagesUrl) {
     try {
       await loadPageItems(pagesUrl);
     } catch (error) {
+      if (handleUnauthorizedError(error)) throw error;
       console.warn("Failed to load OCR pages", error);
       pageItems.value = [{
         pageNumber: 1,
@@ -2313,6 +2725,7 @@ async function extractKeywordResults() {
     scrollReaderToTop();
     document.querySelector(".reader")?.scrollIntoView({ behavior: "smooth", block: "start" });
   } catch (error) {
+    if (handleUnauthorizedError(error)) return;
     keywordResults.value = [];
     keywordStatus.value = `提取失败：${getErrorMessage(error)}`;
   } finally {
@@ -2491,6 +2904,16 @@ function setProgress(percent: number, text?: string) {
 
 function getErrorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error);
+}
+
+function handleUnauthorizedError(error: unknown) {
+  if (!isUnauthorizedError(error)) return false;
+  handleAuthExpired();
+  return true;
+}
+
+function isUnauthorizedError(error: unknown) {
+  return error instanceof ApiError && error.status === 401;
 }
 
 function isMissingJobError(error: unknown) {

@@ -82,6 +82,44 @@ class LlmConversationStorageTest(unittest.TestCase):
         self.assertEqual(conversation["message_count"], 2)
         self.assertEqual(conversation["title"], "hello")
 
+    def test_append_messages_start_sequence_overrides_initial_message_count(self) -> None:
+        store, client = _store_with_fake_client()
+        store.save_llm_conversation(
+            {
+                "conversation_id": "conv-1",
+                "account_id": "acct",
+                "knowledge_base_id": "kb",
+                "message_count": 2,
+            }
+        )
+
+        initial = store.append_llm_messages(
+            {
+                "conversation_id": "conv-1",
+                "account_id": "acct",
+                "knowledge_base_id": "kb",
+                "start_sequence": 1,
+                "message_count": 2,
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "hi"},
+                ],
+            }
+        )
+        follow_up = store.append_llm_messages(
+            {
+                "conversation_id": "conv-1",
+                "account_id": "acct",
+                "knowledge_base_id": "kb",
+                "messages": [{"role": "user", "content": "continue"}],
+            }
+        )
+        conversation = client.documents["ocean_llm_conversations_v1"]["conv-1"]
+
+        self.assertEqual([message["sequence"] for message in initial], [1, 2])
+        self.assertEqual([message["sequence"] for message in follow_up], [3])
+        self.assertEqual(conversation["message_count"], 3)
+
 
 class FakeIndicesClient:
     def __init__(self) -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from copy import deepcopy
 from typing import Any
 from unittest.mock import patch
 
@@ -386,6 +387,39 @@ class WebLlmConversationTest(unittest.TestCase):
         self.assertIn(ab_id, a_ids)
         self.assertIn(ab_id, b_ids)
 
+    def test_persistent_conversation_initial_messages_start_at_sequence_one(self) -> None:
+        store = FakePersistentLlmDocumentStore()
+        app, auth = _authenticated_llm_app(document_store=store)
+        create_conversation = _route_endpoint(app, "/api/llm/conversations", "POST")
+        send_message = _route_endpoint(app, "/api/llm/conversations/{conversation_id}/messages", "POST")
+
+        create_response = create_conversation(
+            {
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "hi"},
+                ]
+            },
+            auth,
+        )
+        conversation_id = create_response["conversation_id"]
+
+        self.assertEqual(store.saved_conversations[0]["message_count"], 0)
+        self.assertEqual(
+            [message["sequence"] for message in store.messages[conversation_id]],
+            [1, 2],
+        )
+        self.assertEqual(store.conversations[conversation_id]["message_count"], 2)
+
+        with patch.object(OpenAICompatibleClient, "chat", return_value="second reply"):
+            send_message(conversation_id, {"content": "continue"}, auth)
+
+        self.assertEqual(
+            [message["sequence"] for message in store.messages[conversation_id]],
+            [1, 2, 3, 4],
+        )
+        self.assertEqual(store.conversations[conversation_id]["message_count"], 4)
+
     def test_send_message_passes_document_context_and_history_to_llm_client(self) -> None:
         app, auth = _authenticated_llm_app(document_store=FakeLlmDocumentStore())
         create_conversation = _route_endpoint(app, "/api/llm/conversations", "POST")
@@ -570,6 +604,84 @@ class FakeLlmDocumentStore:
         ) is None:
             return None
         return self._ocr_documents[document_id]
+
+
+class FakePersistentLlmDocumentStore(FakeLlmDocumentStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.conversations: dict[str, dict[str, Any]] = {}
+        self.messages: dict[str, list[dict[str, Any]]] = {}
+        self.saved_conversations: list[dict[str, Any]] = []
+
+    def save_llm_conversation(self, conversation: dict[str, Any]) -> dict[str, Any]:
+        record = deepcopy(conversation)
+        self.saved_conversations.append(deepcopy(record))
+        self.conversations[str(record["conversation_id"])] = record
+        return deepcopy(record)
+
+    def list_llm_conversations(self, filters: dict[str, Any]) -> list[dict[str, Any]]:
+        account_id = filters.get("account_id")
+        knowledge_base_id = filters.get("knowledge_base_id")
+        records = [
+            deepcopy(record)
+            for record in self.conversations.values()
+            if record.get("account_id") == account_id and record.get("knowledge_base_id") == knowledge_base_id
+        ]
+        return records[: int(filters.get("limit") or 100)]
+
+    def get_llm_conversation(self, query: dict[str, Any]) -> dict[str, Any] | None:
+        conversation_id = str(query.get("conversation_id") or "")
+        record = self.conversations.get(conversation_id)
+        if record is None:
+            return None
+        if query.get("account_id") and record.get("account_id") != query.get("account_id"):
+            return None
+        result = deepcopy(record)
+        if query.get("include_messages"):
+            result["messages"] = [deepcopy(message) for message in self.messages.get(conversation_id, [])]
+        return result
+
+    def append_llm_messages(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        conversation_id = str(payload["conversation_id"])
+        conversation = self.conversations[conversation_id]
+        raw_messages = payload.get("messages") or []
+        if isinstance(raw_messages, dict):
+            raw_messages = [raw_messages]
+        start_sequence = payload.get("start_sequence")
+        next_sequence = int(start_sequence) - 1 if start_sequence not in (None, "") else int(
+            conversation.get("message_count") or 0
+        )
+        appended: list[dict[str, Any]] = []
+        for raw_message in raw_messages:
+            message = deepcopy(raw_message)
+            sequence = message.get("sequence")
+            if sequence in (None, ""):
+                next_sequence += 1
+                sequence = next_sequence
+            else:
+                sequence = int(sequence)
+                next_sequence = max(next_sequence, sequence)
+            message["sequence"] = sequence
+            message["conversation_id"] = conversation_id
+            message.setdefault("account_id", payload.get("account_id"))
+            message.setdefault("knowledge_base_id", payload.get("knowledge_base_id"))
+            appended.append(message)
+        self.messages.setdefault(conversation_id, []).extend(appended)
+        conversation.update(payload.get("conversation_updates") or {})
+        if appended:
+            conversation["message_count"] = int(
+                payload.get("message_count")
+                if payload.get("message_count") not in (None, "")
+                else int(conversation.get("message_count") or 0) + len(appended)
+            )
+        return [deepcopy(message) for message in appended]
+
+    def soft_delete_llm_conversation(self, query: dict[str, Any]) -> dict[str, Any] | None:
+        conversation = self.get_llm_conversation(query)
+        if conversation is None:
+            return None
+        self.conversations[conversation["conversation_id"]]["status"] = "deleted"
+        return deepcopy(self.conversations[conversation["conversation_id"]])
 
 
 def _authenticated_llm_app(

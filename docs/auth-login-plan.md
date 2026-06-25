@@ -10,6 +10,35 @@ The login identity is mapped to the existing Elasticsearch business field:
 login user -> account_id -> OCR Assistant documents/pages/chunks/jobs
 ```
 
+## Security Review Note
+
+Current `config.yaml` is a development configuration. It enables auth and includes
+static test users with known default credentials:
+
+```text
+admin/admin
+local/local
+test/test
+```
+
+This is acceptable only for isolated local development on `127.0.0.1`. It must not
+be used for LAN, public internet, demo, pilot, or production deployments.
+
+Minimum requirements before exposing the service outside the developer machine:
+
+- Replace all default users and passwords in the active config.
+- Use a random, private `OCEAN_JWT_SECRET` that is not committed to git.
+- Do not use shared default passwords for admin accounts.
+- Prefer `pbkdf2_sha256` or bcrypt password hashes for real users.
+- Keep the server bound to `127.0.0.1` until the above items are complete.
+
+Recommended production hardening:
+
+- Move real users to a private deployment config or secret manager.
+- Reject known default password hashes at startup when `auth.enabled=true`.
+- Disable or remove support for unsalted `sha256:` hashes in production mode.
+- Add a documented password rotation path before real users are onboarded.
+
 ## Modes
 
 `auth.enabled: true`
@@ -47,11 +76,14 @@ When `auth.enabled=true`, `.env` must define:
 OCEAN_JWT_SECRET=replace_with_random_secret
 ```
 
-Generate a `sha256:` password hash:
+Generate a temporary local-development `sha256:` password hash:
 
 ```powershell
 python -c "import hashlib; print('sha256:' + hashlib.sha256('your_password'.encode()).hexdigest())"
 ```
+
+Do not use `sha256:` for real users or shared deployments. Use `pbkdf2_sha256`
+or bcrypt before the service is exposed beyond local development.
 
 Example enabled config:
 

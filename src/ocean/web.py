@@ -15,7 +15,6 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from typing import Any
 from urllib.parse import quote
 
@@ -26,8 +25,8 @@ from ocean.llm.client import OpenAICompatibleClient
 from ocean.logging_utils import log, set_log_file
 from ocean.models import ExtractionResult, OcrDocument
 from ocean.ocr import create_ocr_client
-from ocean.pdf_utils import count_pdf_pages, split_pdf
-from ocean.pipeline import _merge_part_documents, _offset_document_pages
+from ocean.pdf_utils import count_pdf_pages
+from ocean.pipeline import _fallback_ocr_config, _recognize_with_fallback
 from ocean.storage import ElasticsearchDocumentStore, create_document_store
 from ocean.storage.elasticsearch import (
     DEFAULT_ACCOUNT_ID,
@@ -494,7 +493,10 @@ def make_app(config: dict[str, Any], output_dir: str | Path = "./outputs"):
             document_store=document_store,
         )
         if _llm_store_enabled(document_store):
-            saved = document_store.save_llm_conversation(_llm_conversation_record(conversation, config))
+            conversation_record = _llm_conversation_record(conversation, config)
+            if conversation.messages:
+                conversation_record["message_count"] = 0
+            saved = document_store.save_llm_conversation(conversation_record)
             if conversation.messages:
                 now = _es_now()
                 document_store.append_llm_messages(
@@ -511,6 +513,7 @@ def make_app(config: dict[str, Any], output_dir: str | Path = "./outputs"):
                             }
                             for message in conversation.messages
                         ],
+                        "start_sequence": 1,
                         "message_count": len(conversation.messages),
                     }
                 )
@@ -1255,7 +1258,9 @@ def _run_job(
         except Exception as exc:  # pragma: no cover - depends on external OCR service
             log(f"Web OCR failed: {exc}")
             _update_job(jobs, jobs_lock, job_id, state="failed", progress=100, message="处理失败", error=str(exc))
-            _save_job_snapshot(document_store, _get_job(job_id, jobs, jobs_lock), finished=True)
+            failed_job = _get_job(job_id, jobs, jobs_lock)
+            _mark_processing_document_failed(document_store, failed_job, config, str(exc))
+            _save_job_snapshot(document_store, failed_job, finished=True)
         finally:
             set_log_file(None)
 
@@ -1289,7 +1294,9 @@ def _run_batch_jobs(
             except Exception as exc:  # pragma: no cover - depends on external OCR service
                 log(f"Web OCR failed: {exc}")
                 _update_job(jobs, jobs_lock, job_id, state="failed", progress=100, message="处理失败", error=str(exc))
-                _save_job_snapshot(document_store, _get_job(job_id, jobs, jobs_lock), finished=True)
+                failed_job = _get_job(job_id, jobs, jobs_lock)
+                _mark_processing_document_failed(document_store, failed_job, config, str(exc))
+                _save_job_snapshot(document_store, failed_job, finished=True)
             finally:
                 set_log_file(None)
 
@@ -1341,41 +1348,33 @@ def _recognize_job(
         _save_job_snapshot(document_store, _get_job(job_id, jobs, jobs_lock))
 
     _update_job(jobs, jobs_lock, job_id, state="running", progress=3, message="读取 PDF 页数")
-    client = create_ocr_client(ocr_config)
     total_pages = count_pdf_pages(job.input_path)
     _update_job(jobs, jobs_lock, job_id, total_pages=total_pages)
     log(f"Web OCR started: {job.file_name}; engine={job.engine}; pages={total_pages}; max_pages_per_file={max_pages}.")
 
-    if total_pages <= max_pages:
-        _update_job(jobs, jobs_lock, job_id, progress=12, message=f"提交到 {engine_label} 并等待解析")
-        document = client.recognize_pdf(job.input_path, options)
-        _update_job(jobs, jobs_lock, job_id, progress=88, message=f"{engine_label} 解析完成，正在生成 Markdown")
-    else:
-        with TemporaryDirectory(prefix="ocean_web_pdf_split_") as temp_dir:
-            parts = split_pdf(job.input_path, temp_dir, max_pages=max_pages)
-            log(f"Web OCR split into {len(parts)} part(s).")
-            part_documents = []
-            for index, part in enumerate(parts, start=1):
-                start_progress = _part_progress(index - 1, len(parts))
-                _update_job(
-                    jobs,
-                    jobs_lock,
-                    job_id,
-                    progress=start_progress,
-                    message=f"正在处理第 {index}/{len(parts)} 段（原 PDF 第 {part.page_start}-{part.page_end} 页）",
-                )
-                log(f"Web OCR part {index}/{len(parts)}: original pages {part.page_start}-{part.page_end}.")
-                part_document = client.recognize_pdf(part.path, options)
-                _offset_document_pages(part_document, part)
-                part_documents.append(part_document)
-                _update_job(
-                    jobs,
-                    jobs_lock,
-                    job_id,
-                    progress=_part_progress(index, len(parts)),
-                    message=f"第 {index}/{len(parts)} 段完成",
-                )
-            document = _merge_part_documents(job.input_path, part_documents, total_pages, max_pages)
+    primary_client = create_ocr_client(ocr_config)
+    fallback_config = _fallback_ocr_config(
+        {
+            "ocr": ocr_config,
+            "ocr_engines": copy.deepcopy(config.get("ocr_engines", {})),
+        }
+    )
+    fallback_client = create_ocr_client(fallback_config) if fallback_config else None
+    file_report: dict[str, Any] = {"attempts": []}
+    _update_job(jobs, jobs_lock, job_id, progress=12, message=f"提交到 {engine_label} 并等待解析")
+    document, used_engine, fallback_used = _recognize_with_fallback(
+        pdf=job.input_path,
+        primary_client=primary_client,
+        primary_config=ocr_config,
+        primary_engine=str(ocr_config.get("engine") or job.engine),
+        fallback_client=fallback_client,
+        fallback_config=fallback_config,
+        file_report=file_report,
+    )
+    used_engine_label = ENGINE_LABELS.get(used_engine, used_engine)
+    _update_job(jobs, jobs_lock, job_id, progress=88, message=f"{used_engine_label} 解析完成，正在生成 Markdown")
+    if fallback_used:
+        log(f"Web OCR fallback used: job={job_id}; engine={used_engine}.")
 
     markdown_path = job.job_dir / f"{Path(job.file_name).stem}.md"
     write_ocr_markdown(document, markdown_path)
@@ -1394,7 +1393,12 @@ def _recognize_job(
             document=document,
             markdown=markdown_text,
             chunk_pages=int(config.get("extraction", {}).get("chunk_pages", 3)),
-            metadata={"web_job_id": job.job_id},
+            metadata={
+                "web_job_id": job.job_id,
+                "requested_ocr_engine": job.engine,
+                "ocr_attempts": file_report["attempts"],
+                "fallback_used": fallback_used,
+            },
         )
     log(f"Web OCR markdown exported: {markdown_path}")
     _update_job(
@@ -1498,6 +1502,58 @@ def _save_processing_document(
             "updated_at": now,
         }
     )
+
+
+def _mark_processing_document_failed(
+    document_store: ElasticsearchDocumentStore | None,
+    job: WebJob | None,
+    config: dict[str, Any],
+    error: str,
+) -> None:
+    if document_store is None or job is None or not job.document_id:
+        return
+    try:
+        ocr_config = _web_ocr_config(config, job.engine)
+        options = ocr_config.get("options", {})
+        file_sha256 = job.file_sha256 or compute_file_sha256(job.input_path)
+        processing_fingerprint = job.processing_fingerprint or build_processing_fingerprint(
+            file_sha256,
+            job.engine,
+            options,
+        )
+        now = _es_now()
+        document_store.save_processing_document(
+            {
+                "account_id": job.account_id,
+                "knowledge_base_id": job.knowledge_base_id,
+                "document_id": job.document_id,
+                "file_name": job.file_name,
+                "file_ext": Path(job.file_name).suffix.lower().lstrip("."),
+                "mime_type": "application/pdf",
+                "file_size": job.input_path.stat().st_size,
+                "file_sha256": file_sha256,
+                "status": "failed",
+                "source": "web_upload",
+                "source_path": str(job.input_path),
+                "ocr_engine": job.engine,
+                "ocr_options_hash": options_hash(options),
+                "pipeline_version": PIPELINE_VERSION,
+                "processing_fingerprint": processing_fingerprint,
+                "page_count": job.total_pages,
+                "language": "",
+                "title": "",
+                "tags": [],
+                "metadata": {"web_job_id": job.job_id, "error": error},
+                "markdown": "",
+                "ocr_json": {},
+                "error": error,
+                "created_at": job.created_at or now,
+                "updated_at": now,
+                "processed_at": now,
+            }
+        )
+    except Exception as exc:  # pragma: no cover - depends on external Elasticsearch
+        log(f"Failed to mark OCR document as failed in Elasticsearch: {exc}")
 
 
 def _save_job_snapshot(

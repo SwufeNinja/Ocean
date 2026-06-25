@@ -221,6 +221,12 @@ export interface SendLlmMessageOptions {
   webSearchEnabled?: boolean;
 }
 
+export interface CreateJobOptions {
+  accountId: string;
+  knowledgeBaseId: string;
+  onUploadProgress?: (percent: number) => void;
+}
+
 export class ApiError extends Error {
   status: number;
 
@@ -230,6 +236,8 @@ export class ApiError extends Error {
     this.status = status;
   }
 }
+
+export const authUnauthorizedEvent = "ocean:auth-unauthorized";
 
 export async function listEngines(): Promise<EnginesResponse> {
   return fetchJson<EnginesResponse>("/api/engines");
@@ -299,14 +307,21 @@ export async function listJobs(options: {
   return fetchJson<JobsResponse>(`/api/jobs?${params.toString()}`);
 }
 
+export interface JobScopeOptions {
+  accountId?: string;
+  knowledgeBaseId?: string;
+}
+
 export function createJob(
   file: File,
   engine: string,
-  onUploadProgress?: (percent: number) => void
+  options: CreateJobOptions
 ): Promise<WebJob> {
   const formData = new FormData();
   formData.append("file", file);
   formData.append("engine", engine);
+  formData.append("account_id", options.accountId);
+  formData.append("knowledge_base_id", options.knowledgeBaseId);
 
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
@@ -314,7 +329,7 @@ export function createJob(
     applyXhrAuth(xhr);
     xhr.upload.onprogress = (event) => {
       if (event.lengthComputable) {
-        onUploadProgress?.(Math.round((event.loaded / event.total) * 8));
+        options.onUploadProgress?.(Math.round((event.loaded / event.total) * 8));
       }
     };
     xhr.onload = () => {
@@ -326,9 +341,9 @@ export function createJob(
         }
         return;
       }
-      reject(new Error(readErrorMessage(xhr.responseText) || "上传失败"));
+      reject(createApiError(xhr.status, readErrorMessage(xhr.responseText) || "上传失败"));
     };
-    xhr.onerror = () => reject(new Error("网络错误"));
+    xhr.onerror = () => reject(createApiError(xhr.status || 0, "网络错误"));
     xhr.send(formData);
   });
 }
@@ -336,13 +351,15 @@ export function createJob(
 export function createJobs(
   files: File[],
   engine: string,
-  onUploadProgress?: (percent: number) => void
+  options: CreateJobOptions
 ): Promise<BatchJobsResponse> {
   const formData = new FormData();
   for (const file of files) {
     formData.append("files", file, filePath(file));
   }
   formData.append("engine", engine);
+  formData.append("account_id", options.accountId);
+  formData.append("knowledge_base_id", options.knowledgeBaseId);
 
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
@@ -350,7 +367,7 @@ export function createJobs(
     applyXhrAuth(xhr);
     xhr.upload.onprogress = (event) => {
       if (event.lengthComputable) {
-        onUploadProgress?.(Math.round((event.loaded / event.total) * 8));
+        options.onUploadProgress?.(Math.round((event.loaded / event.total) * 8));
       }
     };
     xhr.onload = () => {
@@ -362,21 +379,26 @@ export function createJobs(
         }
         return;
       }
-      reject(new Error(readErrorMessage(xhr.responseText) || "上传失败"));
+      reject(createApiError(xhr.status, readErrorMessage(xhr.responseText) || "上传失败"));
     };
-    xhr.onerror = () => reject(new Error("网络错误"));
+    xhr.onerror = () => reject(createApiError(xhr.status || 0, "网络错误"));
     xhr.send(formData);
   });
 }
 
-export async function getJob(jobId: string): Promise<WebJob> {
-  return fetchJson<WebJob>(`/api/jobs/${encodeURIComponent(jobId)}`);
+export async function getJob(jobId: string, options: JobScopeOptions = {}): Promise<WebJob> {
+  const params = new URLSearchParams();
+  if (options.accountId) params.set("account_id", options.accountId);
+  if (options.knowledgeBaseId) params.set("knowledge_base_id", options.knowledgeBaseId);
+  const query = params.toString();
+  const suffix = query ? `?${query}` : "";
+  return fetchJson<WebJob>(`/api/jobs/${encodeURIComponent(jobId)}${suffix}`);
 }
 
 export async function getMarkdown(url: string): Promise<string> {
   const response = await fetch(url, { headers: authHeaders() });
   if (!response.ok) {
-    throw new Error(await readFetchError(response, "Markdown 加载失败"));
+    throw createApiError(response.status, await readFetchError(response, "Markdown 加载失败"));
   }
   return response.text();
 }
@@ -384,7 +406,7 @@ export async function getMarkdown(url: string): Promise<string> {
 export async function downloadTextFile(url: string, fallbackName: string): Promise<void> {
   const response = await fetch(url, { headers: authHeaders() });
   if (!response.ok) {
-    throw new Error(await readFetchError(response, "Download failed"));
+    throw createApiError(response.status, await readFetchError(response, "Download failed"));
   }
   const blob = await response.blob();
   const objectUrl = window.URL.createObjectURL(blob);
@@ -523,7 +545,7 @@ export async function streamLlmMessage(
     })
   );
   if (!response.ok) {
-    throw new ApiError(response.status, await readFetchError(response, "发送失败"));
+    throw createApiError(response.status, await readFetchError(response, "发送失败"));
   }
   if (!response.body) {
     throw new Error("当前浏览器不支持流式响应");
@@ -553,7 +575,7 @@ export async function streamLlmMessage(
       return;
     }
     if (eventName === "error") {
-      throw new ApiError(Number(data.status || 502), String(data.detail || "发送失败"));
+      throw createApiError(Number(data.status || 502), String(data.detail || "发送失败"));
     }
   };
 
@@ -582,7 +604,9 @@ async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
   const text = await response.text();
   const data = text ? JSON.parse(text) : null;
   if (!response.ok) {
-    throw new ApiError(response.status, readErrorPayload(data) || response.statusText || "请求失败");
+      throw createApiError(response.status, readErrorPayload(data) || response.statusText || "请求失败", {
+        notifyUnauthorized: !url.startsWith("/api/auth/login")
+      });
   }
   return data as T;
 }
@@ -607,6 +631,19 @@ function authHeaders(): Record<string, string> {
 function applyXhrAuth(xhr: XMLHttpRequest) {
   const token = getAuthToken();
   if (token) xhr.setRequestHeader("Authorization", `Bearer ${token}`);
+}
+
+function createApiError(
+  status: number,
+  message: string,
+  options: { notifyUnauthorized?: boolean } = {}
+): ApiError {
+  const error = new ApiError(status, message);
+  if (status === 401 && options.notifyUnauthorized !== false) {
+    clearAuthToken();
+    window.dispatchEvent(new CustomEvent(authUnauthorizedEvent));
+  }
+  return error;
 }
 
 function fileNameFromDisposition(value: string | null): string {
